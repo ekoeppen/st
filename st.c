@@ -2423,12 +2423,8 @@ xloadfonts(char *fontstr, int fontsize) {
 		if(result == FcResultMatch) {
 			usedfontsize = (int)fontval;
 		} else {
-			/*
-			 * Default font size is 12, if none given. This is to
-			 * have a known usedfontsize value.
-			 */
-			FcPatternAddDouble(pattern, FC_PIXEL_SIZE, 12);
-			usedfontsize = 12;
+			FcPatternAddDouble(pattern, FC_PIXEL_SIZE, DEFAULT_FONT_SIZE);
+			usedfontsize = DEFAULT_FONT_SIZE;
 		}
 	}
 
@@ -2440,7 +2436,7 @@ xloadfonts(char *fontstr, int fontsize) {
 
 	/* Setting character width and height. */
 	xw.cw = dc.font.width;
-	xw.ch = dc.font.height;
+	xw.ch = dc.font.height + 1;
 
 	FcPatternDel(pattern, FC_WEIGHT);
 	FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_BOLD);
@@ -3003,7 +2999,7 @@ focus(XEvent *ev) {
 	}
 }
 
-inline bool
+bool
 match(uint mask, uint state) {
 	if(mask == XK_NO_MOD && state)
 		return false;
