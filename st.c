@@ -1413,8 +1413,9 @@ tsetattr(int *attr, int l) {
 		case 1:
 			term.c.attr.mode |= ATTR_BOLD;
 			break;
-		case 3:
-			term.c.attr.mode |= ATTR_ITALIC;
+		case 3: /* enter standout (highlight) */
+			term.c.attr.mode |= ATTR_REVERSE;
+			/* term.c.attr.mode |= ATTR_ITALIC; */
 			break;
 		case 4:
 			term.c.attr.mode |= ATTR_UNDERLINE;
@@ -1430,8 +1431,9 @@ tsetattr(int *attr, int l) {
 		case 22:
 			term.c.attr.mode &= ~ATTR_BOLD;
 			break;
-		case 23:
-			term.c.attr.mode &= ~ATTR_ITALIC;
+		case 23: /* leave standout (highlight) mode */
+			term.c.attr.mode &= ~ATTR_REVERSE;
+			/* term.c.attr.mode &= ~ATTR_ITALIC; */
 			break;
 		case 24:
 			term.c.attr.mode &= ~ATTR_UNDERLINE;
