@@ -30,57 +30,74 @@ static unsigned int tabspaces = 8;
 #define S_cyan "#2aa198"
 #define S_green "#859900"
 
-#ifdef SOLARIZED_DARK
+#define S_base03_dark "#002b36"
+#define S_base02_dark "#073642"
+#define S_base01_dark "#586e75"
+#define S_base00_dark "#657b83"
+#define S_base0_dark "#839496"
+#define S_base1_dark "#93a1a1"
+#define S_base2_dark "#eee8d5"
+#define S_base3_dark "#fdf6e3"
 
-#define S_base03 "#002b36"
-#define S_base02 "#073642"
-#define S_base01 "#586e75"
-#define S_base00 "#657b83"
-#define S_base0 "#839496"
-#define S_base1 "#93a1a1"
-#define S_base2 "#eee8d5"
-#define S_base3 "#fdf6e3"
+#define S_base03_light "#fdf6e3"
+#define S_base02_light "#eee8d5"
+#define S_base01_light "#93a1a1"
+#define S_base00_light "#839496"
+#define S_base0_light "#657b83"
+#define S_base1_light "#586e75"
+#define S_base2_light "#073642"
+#define S_base3_light "#002b36"
 
-#else
-
-#define S_base03 "#fdf6e3"
-#define S_base02 "#eee8d5"
-#define S_base01 "#93a1a1"
-#define S_base00 "#839496"
-#define S_base0 "#657b83"
-#define S_base1 "#586e75"
-#define S_base2 "#073642"
-#define S_base3 "#002b36"
-
-#endif
+#define MAX_COLORS 256
 
 /* Terminal colors (16 first used in escape sequence) */
-static const char *colorname[] = {
+static const char *colorname_dark[] = {
 	/* 8 normal colors */
-	S_base02,
+	S_base02_dark,
 	S_red,
 	S_green,
 	S_yellow,
 	S_blue,
 	S_magenta,
 	S_cyan,
-	S_base2,
+	S_base2_dark,
 
 	/* 8 bright colors */
-	S_base03,
+	S_base03_dark,
 	S_orange,
-	S_base01,
-	S_base00,
-	S_base0,
+	S_base01_dark,
+	S_base00_dark,
+	S_base0_dark,
 	S_violet,
-	S_base1,
-	S_base3,
+	S_base1_dark,
+	S_base3_dark,
 
-	[255] = 0,
-
-	/* more colors can be added after 255 to use with DefaultXX */
+	[MAX_COLORS - 1] = 0,
 };
 
+static const char *colorname_light[] = {
+	/* 8 normal colors */
+	S_base02_light,
+	S_red,
+	S_green,
+	S_yellow,
+	S_blue,
+	S_magenta,
+	S_cyan,
+	S_base2_light,
+
+	/* 8 bright colors */
+	S_base03_light,
+	S_orange,
+	S_base01_light,
+	S_base00_light,
+	S_base0_light,
+	S_violet,
+	S_base1_light,
+	S_base3_light,
+
+	[MAX_COLORS - 1] = 0,
+};
 
 /*
  * Default colors (colorname index)
