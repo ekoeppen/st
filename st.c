@@ -1,5 +1,4 @@
 /* See LICENSE for licence details. */
-#define _XOPEN_SOURCE 600
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -20,20 +19,25 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <libgen.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
-#include <X11/extensions/Xdbe.h>
 #include <X11/Xft/Xft.h>
 #include <fontconfig/fontconfig.h>
+
+#include "arg.h"
+
+char *argv0;
 
 #define Glyph Glyph_
 #define Font Font_
 #define Draw XftDraw *
 #define Colour XftColor
 #define Colourmap Colormap
+#define Rectangle XRectangle
 
 #if   defined(__linux)
  #include <pty.h>
@@ -43,10 +47,6 @@
  #include <libutil.h>
 #endif
 
-#define USAGE \
-	"st " VERSION " (c) 2010-2013 st engineers\n" \
-	"usage: st [-v] [-c class] [-f font] [-g geometry] [-o file]" \
-	" [-t title] [-w windowid] [-e command ...]\n"
 
 /* XEMBED messages */
 #define XEMBED_FOCUS_IN  4
@@ -61,6 +61,7 @@
 #define DRAW_BUF_SIZ  20*1024
 #define XK_ANY_MOD    UINT_MAX
 #define XK_NO_MOD     0
+#define XK_SWITCH_MOD (1<<13)
 
 #define REDRAW_TIMEOUT (80*1000) /* 80 ms */
 
@@ -86,6 +87,7 @@ enum glyph_attribute {
 	ATTR_GFX       = 8,
 	ATTR_ITALIC    = 16,
 	ATTR_BLINK     = 32,
+	ATTR_WRAP      = 64,
 };
 
 enum cursor_movement {
@@ -96,35 +98,37 @@ enum cursor_movement {
 enum cursor_state {
 	CURSOR_DEFAULT  = 0,
 	CURSOR_WRAPNEXT = 1,
-	CURSOR_ORIGIN	= 2
-};
-
-enum glyph_state {
-	GLYPH_SET   = 1,
-	GLYPH_DIRTY = 2
+	CURSOR_ORIGIN   = 2
 };
 
 enum term_mode {
-	MODE_WRAP	 = 1,
+	MODE_WRAP        = 1,
 	MODE_INSERT      = 2,
 	MODE_APPKEYPAD   = 4,
 	MODE_ALTSCREEN   = 8,
-	MODE_CRLF	 = 16,
+	MODE_CRLF        = 16,
 	MODE_MOUSEBTN    = 32,
 	MODE_MOUSEMOTION = 64,
-	MODE_MOUSE       = 32|64,
 	MODE_REVERSE     = 128,
 	MODE_KBDLOCK     = 256,
-	MODE_HIDE	 = 512,
-	MODE_ECHO	 = 1024,
-	MODE_APPCURSOR	 = 2048,
+	MODE_HIDE        = 512,
+	MODE_ECHO        = 1024,
+	MODE_APPCURSOR   = 2048,
 	MODE_MOUSESGR    = 4096,
+	MODE_8BIT        = 8192,
+	MODE_BLINK       = 16384,
+	MODE_FBLINK      = 32768,
+	MODE_FOCUS       = 65536,
+	MODE_MOUSEX10    = 131072,
+	MODE_MOUSEMANY   = 262144,
+	MODE_MOUSE       = MODE_MOUSEBTN|MODE_MOUSEMOTION|MODE_MOUSEX10\
+	                  |MODE_MOUSEMANY,
 };
 
 enum escape_state {
 	ESC_START      = 1,
-	ESC_CSI	= 2,
-	ESC_STR	= 4, /* DSC, OSC, PM, APC */
+	ESC_CSI        = 2,
+	ESC_STR        = 4,  /* DSC, OSC, PM, APC */
 	ESC_ALTCHARSET = 8,
 	ESC_STR_END    = 16, /* a final string was encountered */
 	ESC_TEST       = 32, /* Enter in test mode */
@@ -136,9 +140,15 @@ enum window_state {
 	WIN_FOCUSED = 4
 };
 
-/* bit macro */
-#undef B0
-enum { B0=1, B1=2, B2=4, B3=8, B4=16, B5=32, B6=64, B7=128 };
+enum selection_type {
+	SEL_REGULAR = 1,
+	SEL_RECTANGULAR = 2
+};
+
+enum selection_snap {
+	SNAP_WORD = 1,
+	SNAP_LINE = 2
+};
 
 typedef unsigned char uchar;
 typedef unsigned int uint;
@@ -146,17 +156,16 @@ typedef unsigned long ulong;
 typedef unsigned short ushort;
 
 typedef struct {
-	char c[UTF_SIZ];     /* character code */
-	uchar mode;  /* attribute flags */
-	ushort fg;   /* foreground  */
-	ushort bg;   /* background  */
-	uchar state; /* state flags    */
+	char c[UTF_SIZ]; /* character code */
+	uchar mode;      /* attribute flags */
+	ushort fg;       /* foreground  */
+	ushort bg;       /* background  */
 } Glyph;
 
 typedef Glyph *Line;
 
 typedef struct {
-	Glyph attr;	 /* current char attributes */
+	Glyph attr; /* current char attributes */
 	int x;
 	int y;
 	char state;
@@ -166,36 +175,36 @@ typedef struct {
 /* ESC '[' [[ [<priv>] <arg> [;]] <mode>] */
 typedef struct {
 	char buf[ESC_BUF_SIZ]; /* raw string */
-	int len;	       /* raw string length */
+	int len;               /* raw string length */
 	char priv;
 	int arg[ESC_ARG_SIZ];
-	int narg;	       /* nb of args */
+	int narg;              /* nb of args */
 	char mode;
 } CSIEscape;
 
 /* STR Escape sequence structs */
 /* ESC type [[ [<priv>] <arg> [;]] <mode>] ESC '\' */
 typedef struct {
-	char type;	     /* ESC type ... */
+	char type;             /* ESC type ... */
 	char buf[STR_BUF_SIZ]; /* raw string */
-	int len;	       /* raw string length */
+	int len;               /* raw string length */
 	char *args[STR_ARG_SIZ];
-	int narg;	      /* nb of args */
+	int narg;              /* nb of args */
 } STREscape;
 
 /* Internal representation of the screen */
 typedef struct {
-	int row;	/* nb row */
-	int col;	/* nb col */
-	Line *line;	/* screen */
-	Line *alt;	/* alternate screen */
-	bool *dirty;	/* dirtyness of lines */
-	TCursor c;	/* cursor */
-	int top;	/* top    scroll limit */
-	int bot;	/* bottom scroll limit */
-	int mode;	/* terminal mode flags */
-	int esc;	/* escape state flags */
-	bool numlock;	/* lock numbers in keyboard */
+	int row;      /* nb row */
+	int col;      /* nb col */
+	Line *line;   /* screen */
+	Line *alt;    /* alternate screen */
+	bool *dirty;  /* dirtyness of lines */
+	TCursor c;    /* cursor */
+	int top;      /* top    scroll limit */
+	int bot;      /* bottom scroll limit */
+	int mode;     /* terminal mode flags */
+	int esc;      /* escape state flags */
+	bool numlock; /* lock numbers in keyboard */
 	bool *tabs;
 } Term;
 
@@ -210,6 +219,7 @@ typedef struct {
 	XIC xic;
 	Draw draw;
 	Visual *vis;
+	XSetWindowAttributes attrs;
 	int scr;
 	bool isfixed; /* is fixed geometry? */
 	int fx, fy, fw, fh; /* fixed geometry */
@@ -221,23 +231,36 @@ typedef struct {
 } XWindow;
 
 typedef struct {
+	int b;
+	uint mask;
+	char s[ESC_BUF_SIZ];
+} Mousekey;
+
+typedef struct {
 	KeySym k;
 	uint mask;
 	char s[ESC_BUF_SIZ];
 	/* three valued logic variables: 0 indifferent, 1 on, -1 off */
-	signed char appkey;		/* application keypad */
-	signed char appcursor;		/* application cursor */
-	signed char crlf;		/* crlf mode          */
+	signed char appkey;    /* application keypad */
+	signed char appcursor; /* application cursor */
+	signed char crlf;      /* crlf mode          */
 } Key;
 
-/* TODO: use better name for vars... */
 typedef struct {
 	int mode;
-	int bx, by;
-	int ex, ey;
+	int type;
+	int snap;
+	/*
+	 * Selection variables:
+	 * nb – normalized coordinates of the beginning of the selection
+	 * ne – normalized coordinates of the end of the selection
+	 * ob – original coordinates of the beginning of the selection
+	 * oe – original coordinates of the end of the selection
+	 */
 	struct {
 		int x, y;
-	} b, e;
+	} nb, ne, ob, oe;
+
 	char *clip;
 	Atom xtarget;
 	bool alt;
@@ -260,9 +283,10 @@ typedef struct {
 } Shortcut;
 
 /* function definitions used in config.h */
-static void xzoom(const Arg *);
-static void selpaste(const Arg *);
+static void clippaste(const Arg *);
 static void numlock(const Arg *);
+static void selpaste(const Arg *);
+static void xzoom(const Arg *);
 
 /* Config.h for applying patches and the configuration. */
 #include "config.h"
@@ -304,7 +328,8 @@ static void strhandle(void);
 static void strparse(void);
 static void strreset(void);
 
-static void tclearregion(int, int, int, int, int);
+static int tattrset(int);
+static void tclearregion(int, int, int, int);
 static void tcursor(int);
 static void tdeletechar(int);
 static void tdeleteline(int);
@@ -325,6 +350,7 @@ static void tsetchar(char *, Glyph *, int, int);
 static void tsetscroll(int, int);
 static void tswapscreen(void);
 static void tsetdirt(int, int);
+static void tsetdirtattr(int);
 static void tsetmode(bool, bool, int *, int);
 static void tfulldirt(void);
 static void techo(char *, int);
@@ -341,12 +367,17 @@ static void xclear(int, int, int, int);
 static void xdrawcursor(void);
 static void xinit(void);
 static void xloadcols(void);
+static int xsetcolorname(int, const char *);
 static int xloadfont(Font *, FcPattern *);
 static void xloadfonts(char *, int);
+static int xloadfontset(Font *);
+static void xsettitle(char *);
 static void xresettitle(void);
+static void xsetpointermotion(int);
 static void xseturgency(int);
 static void xsetsel(char*);
 static void xtermclear(int, int, int, int);
+static void xunloadfont(Font *f);
 static void xunloadfonts(void);
 static void xresize(int, int);
 
@@ -367,9 +398,11 @@ static void selclear(XEvent *);
 static void selrequest(XEvent *);
 
 static void selinit(void);
+static void selsort(void);
 static inline bool selected(int, int);
 static void selcopy(void);
 static void selscroll(int, int);
+static void selsnap(int, int *, int *, int);
 
 static int utf8decode(char *, long *);
 static int utf8encode(long *, char *);
@@ -415,8 +448,7 @@ static char *opt_embed = NULL;
 static char *opt_class = NULL;
 static char *opt_font = NULL;
 static char **colorname = NULL;
-
-bool usedbe = False;
+static int oldbutton = 3; /* button event on startup: 3 = release */
 
 static char *usedfont = NULL;
 static int usedfontsize = 0;
@@ -431,17 +463,12 @@ enum {
 
 typedef struct {
 	XftFont *font;
-	long c;
 	int flags;
 } Fontcache;
 
-/*
- * Fontcache is a ring buffer, with frccur as current position and frclen as
- * the current length of used elements.
- */
-
-static Fontcache frc[1024];
-static int frccur = -1, frclen = 0;
+/* Fontcache is an array now. A new font will be appended to the array. */
+static Fontcache frc[16];
+static int frclen = 0;
 
 ssize_t
 xwrite(int fd, char *s, size_t len) {
@@ -492,17 +519,17 @@ utf8decode(char *s, long *u) {
 
 	rtn = 1;
 	c = *s;
-	if(~c & B7) { /* 0xxxxxxx */
+	if(~c & 0x80) { /* 0xxxxxxx */
 		*u = c;
 		return rtn;
-	} else if((c & (B7|B6|B5)) == (B7|B6)) { /* 110xxxxx */
-		*u = c&(B4|B3|B2|B1|B0);
+	} else if((c & 0xE0) == 0xC0) { /* 110xxxxx */
+		*u = c & 0x1F;
 		n = 1;
-	} else if((c & (B7|B6|B5|B4)) == (B7|B6|B5)) { /* 1110xxxx */
-		*u = c&(B3|B2|B1|B0);
+	} else if((c & 0xF0) == 0xE0) { /* 1110xxxx */
+		*u = c & 0x0F;
 		n = 2;
-	} else if((c & (B7|B6|B5|B4|B3)) == (B7|B6|B5|B4)) { /* 11110xxx */
-		*u = c & (B2|B1|B0);
+	} else if((c & 0xF8) == 0xF0) { /* 11110xxx */
+		*u = c & 0x07;
 		n = 3;
 	} else {
 		goto invalid;
@@ -510,10 +537,10 @@ utf8decode(char *s, long *u) {
 
 	for(i = n, ++s; i > 0; --i, ++rtn, ++s) {
 		c = *s;
-		if((c & (B7|B6)) != B7) /* 10xxxxxx */
+		if((c & 0xC0) != 0x80) /* 10xxxxxx */
 			goto invalid;
 		*u <<= 6;
-		*u |= c & (B5|B4|B3|B2|B1|B0);
+		*u |= c & 0x3F;
 	}
 
 	if((n == 1 && *u < 0x80) ||
@@ -542,20 +569,20 @@ utf8encode(long *u, char *s) {
 		*sp = uc; /* 0xxxxxxx */
 		return 1;
 	} else if(*u < 0x800) {
-		*sp = (uc >> 6) | (B7|B6); /* 110xxxxx */
+		*sp = (uc >> 6) | 0xC0; /* 110xxxxx */
 		n = 1;
 	} else if(uc < 0x10000) {
-		*sp = (uc >> 12) | (B7|B6|B5); /* 1110xxxx */
+		*sp = (uc >> 12) | 0xE0; /* 1110xxxx */
 		n = 2;
 	} else if(uc <= 0x10FFFF) {
-		*sp = (uc >> 18) | (B7|B6|B5|B4); /* 11110xxx */
+		*sp = (uc >> 18) | 0xF0; /* 11110xxx */
 		n = 3;
 	} else {
 		goto invalid;
 	}
 
 	for(i=n,++sp; i>0; --i,++sp)
-		*sp = ((uc >> 6*(i-1)) & (B5|B4|B3|B2|B1|B0)) | B7; /* 10xxxxxx */
+		*sp = ((uc >> 6*(i-1)) & 0x3F) | 0x80; /* 10xxxxxx */
 
 	return n+1;
 invalid:
@@ -578,16 +605,16 @@ isfullutf8(char *s, int b) {
 	c3 = (uchar *)++s;
 	if(b < 1) {
 		return 0;
-	} else if((*c1&(B7|B6|B5)) == (B7|B6) && b == 1) {
+	} else if((*c1 & 0xE0) == 0xC0 && b == 1) {
 		return 0;
-	} else if((*c1&(B7|B6|B5|B4)) == (B7|B6|B5) &&
+	} else if((*c1 & 0xF0) == 0xE0 &&
 	    ((b == 1) ||
-	    ((b == 2) && (*c2&(B7|B6)) == B7))) {
+	    ((b == 2) && (*c2 & 0xC0) == 0x80))) {
 		return 0;
-	} else if((*c1&(B7|B6|B5|B4|B3)) == (B7|B6|B5|B4) &&
+	} else if((*c1 & 0xF8) == 0xF0 &&
 	    ((b == 1) ||
-	    ((b == 2) && (*c2&(B7|B6)) == B7) ||
-	    ((b == 3) && (*c2&(B7|B6)) == B7 && (*c3&(B7|B6)) == B7))) {
+	    ((b == 2) && (*c2 & 0xC0) == 0x80) ||
+	    ((b == 3) && (*c2 & 0xC0) == 0x80 && (*c3 & 0xC0) == 0x80))) {
 		return 0;
 	} else {
 		return 1;
@@ -598,23 +625,23 @@ int
 utf8size(char *s) {
 	uchar c = *s;
 
-	if(~c&B7) {
+	if(~c & 0x80) {
 		return 1;
-	} else if((c&(B7|B6|B5)) == (B7|B6)) {
+	} else if((c & 0xE0) == 0xC0) {
 		return 2;
-	} else if((c&(B7|B6|B5|B4)) == (B7|B6|B5)) {
+	} else if((c & 0xF0) == 0xE0) {
 		return 3;
 	} else {
 		return 4;
 	}
 }
 
-void
+static void
 selinit(void) {
 	memset(&sel.tclick1, 0, sizeof(sel.tclick1));
 	memset(&sel.tclick2, 0, sizeof(sel.tclick2));
 	sel.mode = 0;
-	sel.bx = -1;
+	sel.ob.x = -1;
 	sel.clip = NULL;
 	sel.xtarget = XInternAtom(xw.dpy, "UTF8_STRING", 0);
 	if(sel.xtarget == None)
@@ -637,33 +664,138 @@ y2row(int y) {
 	return LIMIT(y, 0, term.row-1);
 }
 
+static void
+selsort(void) {
+	if(sel.ob.y == sel.oe.y) {
+		sel.nb.x = MIN(sel.ob.x, sel.oe.x);
+		sel.ne.x = MAX(sel.ob.x, sel.oe.x);
+	} else {
+		sel.nb.x = sel.ob.y < sel.oe.y ? sel.ob.x : sel.oe.x;
+		sel.ne.x = sel.ob.y < sel.oe.y ? sel.oe.x : sel.ob.x;
+	}
+	sel.nb.y = MIN(sel.ob.y, sel.oe.y);
+	sel.ne.y = MAX(sel.ob.y, sel.oe.y);
+}
+
 static inline bool
 selected(int x, int y) {
-	int bx, ex;
+	if(sel.ne.y == y && sel.nb.y == y)
+		return BETWEEN(x, sel.nb.x, sel.ne.x);
 
-	if(sel.ey == y && sel.by == y) {
-		bx = MIN(sel.bx, sel.ex);
-		ex = MAX(sel.bx, sel.ex);
-		return BETWEEN(x, bx, ex);
+	if(sel.type == SEL_RECTANGULAR) {
+		return ((sel.nb.y <= y && y <= sel.ne.y)
+			&& (sel.nb.x <= x && x <= sel.ne.x));
 	}
 
-	return ((sel.b.y < y && y < sel.e.y)
-			|| (y == sel.e.y && x <= sel.e.x))
-			|| (y == sel.b.y && x >= sel.b.x
-				&& (x <= sel.e.x || sel.b.y != sel.e.y));
+	return ((sel.nb.y < y && y < sel.ne.y)
+		|| (y == sel.ne.y && x <= sel.ne.x))
+		|| (y == sel.nb.y && x >= sel.nb.x
+			&& (x <= sel.ne.x || sel.nb.y != sel.ne.y));
+}
+
+void
+selsnap(int mode, int *x, int *y, int direction) {
+	int i;
+
+	switch(mode) {
+	case SNAP_WORD:
+		/*
+		 * Snap around if the word wraps around at the end or
+		 * beginning of a line.
+		 */
+		for(;;) {
+			if(direction < 0 && *x <= 0) {
+				if(*y > 0 && term.line[*y - 1][term.col-1].mode
+						& ATTR_WRAP) {
+					*y -= 1;
+					*x = term.col-1;
+				} else {
+					break;
+				}
+			}
+			if(direction > 0 && *x >= term.col-1) {
+				if(*y < term.row-1 && term.line[*y][*x].mode
+						& ATTR_WRAP) {
+					*y += 1;
+					*x = 0;
+				} else {
+					break;
+				}
+			}
+
+			if(strchr(worddelimiters,
+					term.line[*y][*x + direction].c[0])) {
+				break;
+			}
+
+			*x += direction;
+		}
+		break;
+	case SNAP_LINE:
+		/*
+		 * Snap around if the the previous line or the current one
+		 * has set ATTR_WRAP at its end. Then the whole next or
+		 * previous line will be selected.
+		 */
+		*x = (direction < 0) ? 0 : term.col - 1;
+		if(direction < 0 && *y > 0) {
+			for(; *y > 0; *y += direction) {
+				if(!(term.line[*y-1][term.col-1].mode
+						& ATTR_WRAP)) {
+					break;
+				}
+			}
+		} else if(direction > 0 && *y < term.row-1) {
+			for(; *y < term.row; *y += direction) {
+				if(!(term.line[*y][term.col-1].mode
+						& ATTR_WRAP)) {
+					break;
+				}
+			}
+		}
+		break;
+	default:
+		/*
+		 * Select the whole line when the end of line is reached.
+		 */
+		if(direction > 0) {
+			i = term.col;
+			while(--i > 0 && term.line[*y][i].c[0] == ' ')
+				/* nothing */;
+			if(i > 0 && i < *x)
+				*x = term.col - 1;
+		}
+		break;
+	}
 }
 
 void
 getbuttoninfo(XEvent *e) {
+	int type;
+	uint state = e->xbutton.state &~Button1Mask;
+
 	sel.alt = IS_SET(MODE_ALTSCREEN);
 
-	sel.ex = x2col(e->xbutton.x);
-	sel.ey = y2row(e->xbutton.y);
+	sel.oe.x = x2col(e->xbutton.x);
+	sel.oe.y = y2row(e->xbutton.y);
 
-	sel.b.x = sel.by < sel.ey ? sel.bx : sel.ex;
-	sel.b.y = MIN(sel.by, sel.ey);
-	sel.e.x = sel.by < sel.ey ? sel.ex : sel.bx;
-	sel.e.y = MAX(sel.by, sel.ey);
+	if(sel.ob.y < sel.oe.y
+			|| (sel.ob.y == sel.oe.y && sel.ob.x < sel.oe.x)) {
+		selsnap(sel.snap, &sel.ob.x, &sel.ob.y, -1);
+		selsnap(sel.snap, &sel.oe.x, &sel.oe.y, +1);
+	} else {
+		selsnap(sel.snap, &sel.oe.x, &sel.oe.y, -1);
+		selsnap(sel.snap, &sel.ob.x, &sel.ob.y, +1);
+	}
+	selsort();
+
+	sel.type = SEL_REGULAR;
+	for(type = 1; type < LEN(selmasks); ++type) {
+		if(match(selmasks[type], state)) {
+			sel.type = type;
+			break;
+		}
+	}
 }
 
 void
@@ -672,14 +804,21 @@ mousereport(XEvent *e) {
 	    button = e->xbutton.button, state = e->xbutton.state,
 	    len;
 	char buf[40];
-	static int ob, ox, oy;
+	static int ox, oy;
 
 	/* from urxvt */
 	if(e->xbutton.type == MotionNotify) {
-		if(!IS_SET(MODE_MOUSEMOTION) || (x == ox && y == oy))
+		if(x == ox && y == oy)
 			return;
-		button = ob + 32;
-		ox = x, oy = y;
+		if(!IS_SET(MODE_MOUSEMOTION) && !IS_SET(MODE_MOUSEMANY))
+			return;
+		/* MOUSE_MOTION: no reporting if no button is pressed */
+		if(IS_SET(MODE_MOUSEMOTION) && oldbutton == 3)
+			return;
+
+		button = oldbutton + 32;
+		ox = x;
+		oy = y;
 	} else if(!IS_SET(MODE_MOUSESGR)
 			&& (e->xbutton.type == ButtonRelease
 				|| button == AnyButton)) {
@@ -689,14 +828,17 @@ mousereport(XEvent *e) {
 		if(button >= 3)
 			button += 64 - 3;
 		if(e->xbutton.type == ButtonPress) {
-			ob = button;
-			ox = x, oy = y;
+			oldbutton = button;
+			ox = x;
+			oy = y;
 		}
 	}
 
-	button += (state & ShiftMask   ? 4  : 0)
-		+ (state & Mod4Mask    ? 8  : 0)
-		+ (state & ControlMask ? 16 : 0);
+	if(!IS_SET(MODE_MOUSEX10)) {
+		button += (state & ShiftMask   ? 4  : 0)
+			+ (state & Mod4Mask    ? 8  : 0)
+			+ (state & ControlMask ? 16 : 0);
+	}
 
 	len = 0;
 	if(IS_SET(MODE_MOUSESGR)) {
@@ -705,7 +847,8 @@ mousereport(XEvent *e) {
 				e->xbutton.type == ButtonRelease ? 'm' : 'M');
 	} else if(x < 223 && y < 223) {
 		len = snprintf(buf, sizeof(buf), "\033[M%c%c%c",
-				32+button, 32+x+1, 32+y+1);
+				IS_SET(MODE_MOUSEX10)? button-1 : 32+button,
+				32+x+1, 32+y+1);
 	} else {
 		return;
 	}
@@ -715,56 +858,118 @@ mousereport(XEvent *e) {
 
 void
 bpress(XEvent *e) {
+	struct timeval now;
+	Mousekey *mk;
+
 	if(IS_SET(MODE_MOUSE)) {
 		mousereport(e);
-	} else if(e->xbutton.button == Button1) {
-		if(sel.bx != -1) {
-			sel.bx = -1;
-			tsetdirt(sel.b.y, sel.e.y);
-			draw();
+		return;
+	}
+
+	for(mk = mshortcuts; mk < mshortcuts + LEN(mshortcuts); mk++) {
+		if(e->xbutton.button == mk->b
+				&& match(mk->mask, e->xbutton.state)) {
+			ttywrite(mk->s, strlen(mk->s));
+			if(IS_SET(MODE_ECHO))
+				techo(mk->s, strlen(mk->s));
+			return;
 		}
+	}
+
+	if(e->xbutton.button == Button1) {
+		gettimeofday(&now, NULL);
+
+		/* Clear previous selection, logically and visually. */
+		selclear(NULL);
 		sel.mode = 1;
-		sel.ex = sel.bx = x2col(e->xbutton.x);
-		sel.ey = sel.by = y2row(e->xbutton.y);
-	} else if(e->xbutton.button == Button4) {
-		ttywrite("\031", 1);
-	} else if(e->xbutton.button == Button5) {
-		ttywrite("\005", 1);
+		sel.type = SEL_REGULAR;
+		sel.oe.x = sel.ob.x = x2col(e->xbutton.x);
+		sel.oe.y = sel.ob.y = y2row(e->xbutton.y);
+
+		/*
+		 * If the user clicks below predefined timeouts specific
+		 * snapping behaviour is exposed.
+		 */
+		if(TIMEDIFF(now, sel.tclick2) <= tripleclicktimeout) {
+			sel.snap = SNAP_LINE;
+		} else if(TIMEDIFF(now, sel.tclick1) <= doubleclicktimeout) {
+			sel.snap = SNAP_WORD;
+		} else {
+			sel.snap = 0;
+		}
+		selsnap(sel.snap, &sel.ob.x, &sel.ob.y, -1);
+		selsnap(sel.snap, &sel.oe.x, &sel.oe.y, +1);
+		selsort();
+
+		/*
+		 * Draw selection, unless it's regular and we don't want to
+		 * make clicks visible
+		 */
+		if(sel.snap != 0) {
+			sel.mode++;
+			tsetdirt(sel.nb.y, sel.ne.y);
+		}
+		sel.tclick2 = sel.tclick1;
+		sel.tclick1 = now;
 	}
 }
 
 void
 selcopy(void) {
-	char *str, *ptr, *p;
-	int x, y, bufsize, is_selected = 0, size;
+	char *str, *ptr;
+	int x, y, bufsize, size, i, ex;
 	Glyph *gp, *last;
 
-	if(sel.bx == -1) {
+	if(sel.ob.x == -1) {
 		str = NULL;
 	} else {
-		bufsize = (term.col+1) * (sel.e.y-sel.b.y+1) * UTF_SIZ;
+		bufsize = (term.col+1) * (sel.ne.y-sel.nb.y+1) * UTF_SIZ;
 		ptr = str = xmalloc(bufsize);
 
 		/* append every set & selected glyph to the selection */
-		for(y = 0; y < term.row; y++) {
+		for(y = sel.nb.y; y < sel.ne.y + 1; y++) {
 			gp = &term.line[y][0];
 			last = gp + term.col;
 
-			while(--last >= gp && !(last->state & GLYPH_SET))
+			while(--last >= gp && !(selected(last - gp, y) && \
+						strcmp(last->c, " ") != 0))
 				/* nothing */;
 
 			for(x = 0; gp <= last; x++, ++gp) {
-				if(!(is_selected = selected(x, y)))
+				if(!selected(x, y))
 					continue;
 
-				p = (gp->state & GLYPH_SET) ? gp->c : " ";
-				size = utf8size(p);
-				memcpy(ptr, p, size);
+				size = utf8size(gp->c);
+				memcpy(ptr, gp->c, size);
 				ptr += size;
 			}
-			/* \n at the end of every selected line except for the last one */
-			if(is_selected && y < sel.e.y)
+
+			/*
+			 * Copy and pasting of line endings is inconsistent
+			 * in the inconsistent terminal and GUI world.
+			 * The best solution seems like to produce '\n' when
+			 * something is copied from st and convert '\n' to
+			 * '\r', when something to be pasted is received by
+			 * st.
+			 * FIXME: Fix the computer world.
+			 */
+			if(y < sel.ne.y && !((gp-1)->mode & ATTR_WRAP))
 				*ptr++ = '\n';
+
+			/*
+			 * If the last selected line expands in the selection
+			 * after the visible text '\n' is appended.
+			 */
+			if(y == sel.ne.y) {
+				i = term.col;
+				while(--i > 0 && term.line[y][i].c[0] == ' ')
+					/* nothing */;
+				ex = sel.ne.x;
+				if(sel.nb.y == sel.ne.y && sel.ne.x < sel.nb.x)
+					ex = sel.nb.x;
+				if(i < ex)
+					*ptr++ = '\n';
+			}
 		}
 		*ptr = 0;
 	}
@@ -775,7 +980,7 @@ void
 selnotify(XEvent *e) {
 	ulong nitems, ofs, rem;
 	int format;
-	uchar *data;
+	uchar *data, *last, *repl;
 	Atom type;
 
 	ofs = 0;
@@ -786,7 +991,21 @@ selnotify(XEvent *e) {
 			fprintf(stderr, "Clipboard allocation failed\n");
 			return;
 		}
-		ttywrite((const char *) data, nitems * format / 8);
+
+		/*
+		 * As seen in selcopy:
+		 * Line endings are inconsistent in the terminal and GUI world
+		 * copy and pasting. When receiving some selection data,
+		 * replace all '\n' with '\r'.
+		 * FIXME: Fix the computer world.
+		 */
+		repl = data;
+		last = data + nitems * format / 8;
+		while((repl = memchr(repl, '\n', last - repl))) {
+			*repl++ = '\r';
+		}
+
+		ttywrite((const char *)data, nitems * format / 8);
 		XFree(data);
 		/* number of 32-bit chunks returned */
 		ofs += nitems * format / 32;
@@ -799,11 +1018,21 @@ selpaste(const Arg *dummy) {
 			xw.win, CurrentTime);
 }
 
-void selclear(XEvent *e) {
-	if(sel.bx == -1)
+void
+clippaste(const Arg *dummy) {
+	Atom clipboard;
+
+	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
+	XConvertSelection(xw.dpy, clipboard, sel.xtarget, XA_PRIMARY,
+			xw.win, CurrentTime);
+}
+
+void
+selclear(XEvent *e) {
+	if(sel.ob.x == -1)
 		return;
-	sel.bx = -1;
-	tsetdirt(sel.b.y, sel.e.y);
+	sel.ob.x = -1;
+	tsetdirt(sel.nb.y, sel.ne.y);
 }
 
 void
@@ -857,8 +1086,6 @@ xsetsel(char *str) {
 
 void
 brelease(XEvent *e) {
-	struct timeval now;
-
 	if(IS_SET(MODE_MOUSE)) {
 		mousereport(e);
 		return;
@@ -867,47 +1094,20 @@ brelease(XEvent *e) {
 	if(e->xbutton.button == Button2) {
 		selpaste(NULL);
 	} else if(e->xbutton.button == Button1) {
-		sel.mode = 0;
-		getbuttoninfo(e);
-		term.dirty[sel.ey] = 1;
-		if(sel.bx == sel.ex && sel.by == sel.ey) {
-			sel.bx = -1;
-			gettimeofday(&now, NULL);
-
-			if(TIMEDIFF(now, sel.tclick2) <= tripleclicktimeout) {
-				/* triple click on the line */
-				sel.b.x = sel.bx = 0;
-				sel.e.x = sel.ex = term.col;
-				sel.b.y = sel.e.y = sel.ey;
-				selcopy();
-			} else if(TIMEDIFF(now, sel.tclick1) <= doubleclicktimeout) {
-				/* double click to select word */
-				sel.bx = sel.ex;
-				while(sel.bx > 0 && term.line[sel.ey][sel.bx-1].state & GLYPH_SET &&
-						term.line[sel.ey][sel.bx-1].c[0] != ' ') {
-					sel.bx--;
-				}
-				sel.b.x = sel.bx;
-				while(sel.ex < term.col-1 && term.line[sel.ey][sel.ex+1].state & GLYPH_SET &&
-						term.line[sel.ey][sel.ex+1].c[0] != ' ') {
-					sel.ex++;
-				}
-				sel.e.x = sel.ex;
-				sel.b.y = sel.e.y = sel.ey;
-				selcopy();
-			}
+		if(sel.mode < 2) {
+			selclear(NULL);
 		} else {
+			getbuttoninfo(e);
 			selcopy();
 		}
+		sel.mode = 0;
+		tsetdirt(sel.nb.y, sel.ne.y);
 	}
-
-	memcpy(&sel.tclick2, &sel.tclick1, sizeof(struct timeval));
-	gettimeofday(&sel.tclick1, NULL);
 }
 
 void
 bmotion(XEvent *e) {
-	int starty, endy, oldey, oldex;
+	int oldey, oldex, oldsby, oldsey;
 
 	if(IS_SET(MODE_MOUSE)) {
 		mousereport(e);
@@ -917,15 +1117,15 @@ bmotion(XEvent *e) {
 	if(!sel.mode)
 		return;
 
-	oldey = sel.ey;
-	oldex = sel.ex;
+	sel.mode++;
+	oldey = sel.oe.y;
+	oldex = sel.oe.x;
+	oldsby = sel.nb.y;
+	oldsey = sel.ne.y;
 	getbuttoninfo(e);
 
-	if(oldey != sel.ey || oldex != sel.ex) {
-		starty = MIN(oldey, sel.ey);
-		endy = MAX(oldey, sel.ey);
-		tsetdirt(starty, endy);
-	}
+	if(oldey != sel.oe.y || oldex != sel.oe.x)
+		tsetdirt(MIN(sel.nb.y, oldsby), MAX(sel.ne.y, oldsey));
 }
 
 void
@@ -978,7 +1178,7 @@ sigchld(int a) {
 	int stat = 0;
 
 	if(waitpid(pid, &stat, 0) < 0)
-		die("Waiting for pid %hd failed: %s\n",	pid, SERRNO);
+		die("Waiting for pid %hd failed: %s\n", pid, SERRNO);
 
 	if(WIFEXITED(stat)) {
 		exit(WEXITSTATUS(stat));
@@ -1083,6 +1283,20 @@ ttyresize(void) {
 		fprintf(stderr, "Couldn't set window size: %s\n", SERRNO);
 }
 
+int
+tattrset(int attr) {
+	int i, j;
+
+	for(i = 0; i < term.row-1; i++) {
+		for(j = 0; j < term.col-1; j++) {
+			if(term.line[i][j].mode & attr)
+				return 1;
+		}
+	}
+
+	return 0;
+}
+
 void
 tsetdirt(int top, int bot) {
 	int i;
@@ -1092,6 +1306,20 @@ tsetdirt(int top, int bot) {
 
 	for(i = top; i <= bot; i++)
 		term.dirty[i] = 1;
+}
+
+void
+tsetdirtattr(int attr) {
+	int i, j;
+
+	for(i = 0; i < term.row-1; i++) {
+		for(j = 0; j < term.col-1; j++) {
+			if(term.line[i][j].mode & attr) {
+				tsetdirt(i, i);
+				break;
+			}
+		}
+	}
 }
 
 void
@@ -1128,30 +1356,17 @@ treset(void) {
 	term.bot = term.row - 1;
 	term.mode = MODE_WRAP;
 
-	tclearregion(0, 0, term.col-1, term.row-1, 0);
+	tclearregion(0, 0, term.col-1, term.row-1);
 	tmoveto(0, 0);
 	tcursor(CURSOR_SAVE);
 }
 
 void
 tnew(int col, int row) {
-	/* set screen size */
-	term.row = row;
-	term.col = col;
-	term.line = xmalloc(term.row * sizeof(Line));
-	term.alt  = xmalloc(term.row * sizeof(Line));
-	term.dirty = xmalloc(term.row * sizeof(*term.dirty));
-	term.tabs = xmalloc(term.col * sizeof(*term.tabs));
-
-	for(row = 0; row < term.row; row++) {
-		term.line[row] = xmalloc(term.col * sizeof(Glyph));
-		term.alt [row] = xmalloc(term.col * sizeof(Glyph));
-		term.dirty[row] = 0;
-	}
-
+	memset(&term, 0, sizeof(Term));
+	tresize(col, row);
 	term.numlock = 1;
-	memset(term.tabs, 0, term.col * sizeof(*term.tabs));
-	/* setup screen */
+
 	treset();
 }
 
@@ -1172,7 +1387,7 @@ tscrolldown(int orig, int n) {
 
 	LIMIT(n, 0, term.bot-orig+1);
 
-	tclearregion(0, term.bot-n+1, term.col-1, term.bot, 0);
+	tclearregion(0, term.bot-n+1, term.col-1, term.bot);
 
 	for(i = term.bot; i >= orig+n; i--) {
 		temp = term.line[i];
@@ -1192,7 +1407,7 @@ tscrollup(int orig, int n) {
 	Line temp;
 	LIMIT(n, 0, term.bot-orig+1);
 
-	tclearregion(0, orig, term.col-1, orig+n-1, 0);
+	tclearregion(0, orig, term.col-1, orig+n-1);
 
 	for(i = orig; i <= term.bot-n; i++) {
 		 temp = term.line[i];
@@ -1208,24 +1423,30 @@ tscrollup(int orig, int n) {
 
 void
 selscroll(int orig, int n) {
-	if(sel.bx == -1)
+	if(sel.ob.x == -1)
 		return;
 
-	if(BETWEEN(sel.by, orig, term.bot) || BETWEEN(sel.ey, orig, term.bot)) {
-		if((sel.by += n) > term.bot || (sel.ey += n) < term.top) {
-			sel.bx = -1;
+	if(BETWEEN(sel.ob.y, orig, term.bot) || BETWEEN(sel.oe.y, orig, term.bot)) {
+		if((sel.ob.y += n) > term.bot || (sel.oe.y += n) < term.top) {
+			selclear(NULL);
 			return;
 		}
-		if(sel.by < term.top) {
-			sel.by = term.top;
-			sel.bx = 0;
+		if(sel.type == SEL_RECTANGULAR) {
+			if(sel.ob.y < term.top)
+				sel.ob.y = term.top;
+			if(sel.oe.y > term.bot)
+				sel.oe.y = term.bot;
+		} else {
+			if(sel.ob.y < term.top) {
+				sel.ob.y = term.top;
+				sel.ob.x = 0;
+			}
+			if(sel.oe.y > term.bot) {
+				sel.oe.y = term.bot;
+				sel.oe.x = term.col;
+			}
 		}
-		if(sel.ey > term.bot) {
-			sel.ey = term.bot;
-			sel.ex = term.col;
-		}
-		sel.b.y = sel.by, sel.b.x = sel.bx;
-		sel.e.y = sel.ey, sel.e.x = sel.ex;
+		selsort();
 	}
 }
 
@@ -1243,27 +1464,30 @@ tnewline(int first_col) {
 
 void
 csiparse(void) {
-	/* int noarg = 1; */
-	char *p = csiescseq.buf;
+	char *p = csiescseq.buf, *np;
+	long int v;
 
 	csiescseq.narg = 0;
-	if(*p == '?')
-		csiescseq.priv = 1, p++;
-
-	while(p < csiescseq.buf+csiescseq.len) {
-		while(isdigit(*p)) {
-			csiescseq.arg[csiescseq.narg] *= 10;
-			csiescseq.arg[csiescseq.narg] += *p++ - '0'/*, noarg = 0 */;
-		}
-		if(*p == ';' && csiescseq.narg+1 < ESC_ARG_SIZ) {
-			csiescseq.narg++, p++;
-		} else {
-			csiescseq.mode = *p;
-			csiescseq.narg++;
-
-			return;
-		}
+	if(*p == '?') {
+		csiescseq.priv = 1;
+		p++;
 	}
+
+	csiescseq.buf[csiescseq.len] = '\0';
+	while(p < csiescseq.buf+csiescseq.len) {
+		np = NULL;
+		v = strtol(p, &np, 10);
+		if(np == p)
+			v = 0;
+		if(v == LONG_MAX || v == LONG_MIN)
+			v = -1;
+		csiescseq.arg[csiescseq.narg++] = v;
+		p = np;
+		if(*p != ';' || csiescseq.narg == ESC_ARG_SIZ)
+			break;
+		p++;
+	}
+	csiescseq.mode = *p;
 }
 
 /* for absolute user moves, when decom is set */
@@ -1316,11 +1540,10 @@ tsetchar(char *c, Glyph *attr, int x, int y) {
 	term.dirty[y] = 1;
 	term.line[y][x] = *attr;
 	memcpy(term.line[y][x].c, c, UTF_SIZ);
-	term.line[y][x].state |= GLYPH_SET;
 }
 
 void
-tclearregion(int x1, int y1, int x2, int y2, int bce) {
+tclearregion(int x1, int y1, int x2, int y2) {
 	int x, y, temp;
 
 	if(x1 > x2)
@@ -1336,13 +1559,10 @@ tclearregion(int x1, int y1, int x2, int y2, int bce) {
 	for(y = y1; y <= y2; y++) {
 		term.dirty[y] = 1;
 		for(x = x1; x <= x2; x++) {
-			if(bce) {
-				term.line[y][x] = term.c.attr;
-				memcpy(term.line[y][x].c, " ", 2);
-				term.line[y][x].state |= GLYPH_SET;
-			} else {
-				term.line[y][x].state = 0;
-			}
+			if(selected(x, y))
+				selclear(NULL);
+			term.line[y][x] = term.c.attr;
+			memcpy(term.line[y][x].c, " ", 2);
 		}
 	}
 }
@@ -1356,13 +1576,13 @@ tdeletechar(int n) {
 	term.dirty[term.c.y] = 1;
 
 	if(src >= term.col) {
-		tclearregion(term.c.x, term.c.y, term.col-1, term.c.y, 0);
+		tclearregion(term.c.x, term.c.y, term.col-1, term.c.y);
 		return;
 	}
 
 	memmove(&term.line[term.c.y][dst], &term.line[term.c.y][src],
 			size * sizeof(Glyph));
-	tclearregion(term.col-n, term.c.y, term.col-1, term.c.y, 0);
+	tclearregion(term.col-n, term.c.y, term.col-1, term.c.y);
 }
 
 void
@@ -1374,13 +1594,13 @@ tinsertblank(int n) {
 	term.dirty[term.c.y] = 1;
 
 	if(dst >= term.col) {
-		tclearregion(term.c.x, term.c.y, term.col-1, term.c.y, 0);
+		tclearregion(term.c.x, term.c.y, term.col-1, term.c.y);
 		return;
 	}
 
 	memmove(&term.line[term.c.y][dst], &term.line[term.c.y][src],
 			size * sizeof(Glyph));
-	tclearregion(src, term.c.y, dst - 1, term.c.y, 0);
+	tclearregion(src, term.c.y, dst - 1, term.c.y);
 }
 
 void
@@ -1406,8 +1626,9 @@ tsetattr(int *attr, int l) {
 	for(i = 0; i < l; i++) {
 		switch(attr[i]) {
 		case 0:
-			term.c.attr.mode &= ~(ATTR_REVERSE | ATTR_UNDERLINE | ATTR_BOLD \
-					| ATTR_ITALIC | ATTR_BLINK);
+			term.c.attr.mode &= ~(ATTR_REVERSE | ATTR_UNDERLINE \
+					| ATTR_BOLD | ATTR_ITALIC \
+					| ATTR_BLINK);
 			term.c.attr.fg = defaultfg;
 			term.c.attr.bg = defaultbg;
 			break;
@@ -1558,32 +1779,63 @@ tsetmode(bool priv, bool set, int *args, int narg) {
 			case 25: /* DECTCEM -- Text Cursor Enable Mode */
 				MODBIT(term.mode, !set, MODE_HIDE);
 				break;
-			case 1000: /* 1000,1002: enable xterm mouse report */
+			case 9:    /* X10 mouse compatibility mode */
+				xsetpointermotion(0);
+				MODBIT(term.mode, 0, MODE_MOUSE);
+				MODBIT(term.mode, set, MODE_MOUSEX10);
+				break;
+			case 1000: /* 1000: report button press */
+				xsetpointermotion(0);
+				MODBIT(term.mode, 0, MODE_MOUSE);
 				MODBIT(term.mode, set, MODE_MOUSEBTN);
 				break;
-			case 1002:
+			case 1002: /* 1002: report motion on button press */
+				xsetpointermotion(0);
+				MODBIT(term.mode, 0, MODE_MOUSE);
 				MODBIT(term.mode, set, MODE_MOUSEMOTION);
 				break;
-			case 1006:
+			case 1003: /* 1003: enable all mouse motions */
+				xsetpointermotion(set);
+				MODBIT(term.mode, 0, MODE_MOUSE);
+				MODBIT(term.mode, set, MODE_MOUSEMANY);
+				break;
+			case 1004: /* 1004: send focus events to tty */
+				MODBIT(term.mode, set, MODE_FOCUS);
+				break;
+			case 1006: /* 1006: extended reporting mode */
 				MODBIT(term.mode, set, MODE_MOUSESGR);
+				break;
+			case 1034:
+				MODBIT(term.mode, set, MODE_8BIT);
 				break;
 			case 1049: /* = 1047 and 1048 */
 			case 47:
-			case 1047: {
+			case 1047:
+				if (!allowaltscreen)
+					break;
+
 				alt = IS_SET(MODE_ALTSCREEN);
 				if(alt) {
 					tclearregion(0, 0, term.col-1,
-							term.row-1, 0);
+							term.row-1);
 				}
-				if(set ^ alt)		/* set is always 1 or 0 */
+				if(set ^ alt) /* set is always 1 or 0 */
 					tswapscreen();
 				if(*args != 1049)
 					break;
-			}
-				/* pass through */
+				/* FALLTRU */
 			case 1048:
 				tcursor((set) ? CURSOR_SAVE : CURSOR_LOAD);
 				break;
+			/* Not implemented mouse modes. See comments there. */
+			case 1001: /* mouse highlight mode; can hang the
+				      terminal by design when implemented. */
+			case 1005: /* UTF-8 mouse mode; will confuse
+				      applications not supporting UTF-8
+				      and luit. */
+			case 1015: /* urxvt mangled mouse mode; incompatible
+				      and can be mistaken for other control
+				      codes. */
 			default:
 				fprintf(stderr,
 					"erresc: unknown private set/reset mode %d\n",
@@ -1615,8 +1867,6 @@ tsetmode(bool priv, bool set, int *args, int narg) {
 		}
 	}
 }
-#undef MODBIT
-
 
 void
 csihandle(void) {
@@ -1662,7 +1912,7 @@ csihandle(void) {
 		tmoveto(0, term.c.y-csiescseq.arg[0]);
 		break;
 	case 'g': /* TBC -- Tabulation clear */
-		switch (csiescseq.arg[0]) {
+		switch(csiescseq.arg[0]) {
 		case 0: /* clear current tab stop */
 			term.tabs[term.c.x] = 0;
 			break;
@@ -1690,22 +1940,22 @@ csihandle(void) {
 			tputtab(1);
 		break;
 	case 'J': /* ED -- Clear screen */
-		sel.bx = -1;
+		selclear(NULL);
 		switch(csiescseq.arg[0]) {
 		case 0: /* below */
-			tclearregion(term.c.x, term.c.y, term.col-1, term.c.y, 1);
+			tclearregion(term.c.x, term.c.y, term.col-1, term.c.y);
 			if(term.c.y < term.row-1) {
 				tclearregion(0, term.c.y+1, term.col-1,
-						term.row-1, 1);
+						term.row-1);
 			}
 			break;
 		case 1: /* above */
 			if(term.c.y > 1)
-				tclearregion(0, 0, term.col-1, term.c.y-1, 1);
-			tclearregion(0, term.c.y, term.c.x, term.c.y, 1);
+				tclearregion(0, 0, term.col-1, term.c.y-1);
+			tclearregion(0, term.c.y, term.c.x, term.c.y);
 			break;
 		case 2: /* all */
-			tclearregion(0, 0, term.col-1, term.row-1, 1);
+			tclearregion(0, 0, term.col-1, term.row-1);
 			break;
 		default:
 			goto unknown;
@@ -1715,13 +1965,13 @@ csihandle(void) {
 		switch(csiescseq.arg[0]) {
 		case 0: /* right */
 			tclearregion(term.c.x, term.c.y, term.col-1,
-					term.c.y, 1);
+					term.c.y);
 			break;
 		case 1: /* left */
-			tclearregion(0, term.c.y, term.c.x, term.c.y, 1);
+			tclearregion(0, term.c.y, term.c.x, term.c.y);
 			break;
 		case 2: /* all */
-			tclearregion(0, term.c.y, term.col-1, term.c.y, 1);
+			tclearregion(0, term.c.y, term.col-1, term.c.y);
 			break;
 		}
 		break;
@@ -1747,7 +1997,7 @@ csihandle(void) {
 	case 'X': /* ECH -- Erase <n> char */
 		DEFAULT(csiescseq.arg[0], 1);
 		tclearregion(term.c.x, term.c.y,
-				term.c.x + csiescseq.arg[0] - 1, term.c.y, 1);
+				term.c.x + csiescseq.arg[0] - 1, term.c.y);
 		break;
 	case 'P': /* DCH -- Delete <n> char */
 		DEFAULT(csiescseq.arg[0], 1);
@@ -1817,32 +2067,37 @@ csireset(void) {
 
 void
 strhandle(void) {
-	char *p;
+	char *p = NULL;
+	int i, j, narg;
 
-	/*
-	 * TODO: make this being useful in case of color palette change.
-	 */
 	strparse();
-
-	p = strescseq.buf;
+	narg = strescseq.narg;
 
 	switch(strescseq.type) {
 	case ']': /* OSC -- Operating System Command */
-		switch(p[0]) {
-		case '0':
-		case '1':
-		case '2':
-			/*
-			 * TODO: Handle special chars in string, like umlauts.
-			 */
-			if(p[1] == ';') {
-				XStoreName(xw.dpy, xw.win, strescseq.buf+2);
+		switch(i = atoi(strescseq.args[0])) {
+		case 0:
+		case 1:
+		case 2:
+			if(narg > 1)
+				xsettitle(strescseq.args[1]);
+			break;
+		case 4: /* color set */
+			if(narg < 3)
+				break;
+			p = strescseq.args[2];
+			/* fall through */
+		case 104: /* color reset, here p = NULL */
+			j = (narg > 1) ? atoi(strescseq.args[1]) : -1;
+			if (!xsetcolorname(j, p)) {
+				fprintf(stderr, "erresc: invalid color %s\n", p);
+			} else {
+				/*
+				 * TODO if defaultbg color is changed, borders
+				 * are dirty
+				 */
+				redraw(0);
 			}
-			break;
-		case ';':
-			XStoreName(xw.dpy, xw.win, strescseq.buf+1);
-			break;
-		case '4': /* TODO: Set color (arg0) to "rgb:%hexr/$hexg/$hexb" (arg1) */
 			break;
 		default:
 			fprintf(stderr, "erresc: unknown str ");
@@ -1851,7 +2106,7 @@ strhandle(void) {
 		}
 		break;
 	case 'k': /* old title set compatibility */
-		XStoreName(xw.dpy, xw.win, strescseq.buf);
+		xsettitle(strescseq.args[0]);
 		break;
 	case 'P': /* DSC -- Device Control String */
 	case '_': /* APC -- Application Program Command */
@@ -1866,11 +2121,12 @@ strhandle(void) {
 
 void
 strparse(void) {
-	/*
-	 * TODO: Implement parsing like for CSI when required.
-	 * Format: ESC type cmd ';' arg0 [';' argn] ESC \
-	 */
-	return;
+	char *p = strescseq.buf;
+
+	strescseq.narg = 0;
+	strescseq.buf[strescseq.len] = '\0';
+	while(p && strescseq.narg < STR_ARG_SIZ)
+		strescseq.args[strescseq.narg++] = strsep(&p, ";");
 }
 
 void
@@ -1881,7 +2137,9 @@ strdump(void) {
 	printf("ESC%c", strescseq.type);
 	for(i = 0; i < strescseq.len; i++) {
 		c = strescseq.buf[i] & 0xff;
-		if(isprint(c)) {
+		if(c == '\0') {
+			return;
+		} else if(isprint(c)) {
 			putchar(c);
 		} else if(c == '\n') {
 			printf("(\\n)");
@@ -1924,10 +2182,10 @@ techo(char *buf, int len) {
 	for(; len > 0; buf++, len--) {
 		char c = *buf;
 
-		if(c == '\033') {		/* escape */
+		if(c == '\033') { /* escape */
 			tputc("^", 1);
 			tputc("[", 1);
-		} else if (c < '\x20') {	/* control code */
+		} else if(c < '\x20') { /* control code */
 			if(c != '\n' && c != '\r' && c != '\t') {
 				c |= '\x40';
 				tputc("^", 1);
@@ -1937,7 +2195,7 @@ techo(char *buf, int len) {
 			break;
 		}
 	}
-	if (len)
+	if(len)
 		tputc(buf, len);
 }
 
@@ -1947,7 +2205,7 @@ tputc(char *c, int len) {
 	bool control = ascii < '\x20' || ascii == 0177;
 
 	if(iofd != -1) {
-		if (xwrite(iofd, c, len) < 0) {
+		if(xwrite(iofd, c, len) < 0) {
 			fprintf(stderr, "Error writing in %s:%s\n",
 				opt_io, strerror(errno));
 			close(iofd);
@@ -1969,7 +2227,7 @@ tputc(char *c, int len) {
 			strhandle();
 			break;
 		default:
-			if(strescseq.len + len < sizeof(strescseq.buf)) {
+			if(strescseq.len + len < sizeof(strescseq.buf) - 1) {
 				memmove(&strescseq.buf[strescseq.len], c, len);
 				strescseq.len += len;
 			} else {
@@ -1998,31 +2256,31 @@ tputc(char *c, int len) {
 	 */
 	if(control) {
 		switch(ascii) {
-		case '\t':	/* HT */
+		case '\t':   /* HT */
 			tputtab(1);
 			return;
-		case '\b':	/* BS */
+		case '\b':   /* BS */
 			tmoveto(term.c.x-1, term.c.y);
 			return;
-		case '\r':	/* CR */
+		case '\r':   /* CR */
 			tmoveto(0, term.c.y);
 			return;
-		case '\f':	/* LF */
-		case '\v':	/* VT */
-		case '\n':	/* LF */
+		case '\f':   /* LF */
+		case '\v':   /* VT */
+		case '\n':   /* LF */
 			/* go to first col if the mode is set */
 			tnewline(IS_SET(MODE_CRLF));
 			return;
-		case '\a':	/* BEL */
+		case '\a':   /* BEL */
 			if(!(xw.state & WIN_FOCUSED))
 				xseturgency(1);
 			return;
-		case '\033':	/* ESC */
+		case '\033': /* ESC */
 			csireset();
 			term.esc = ESC_START;
 			return;
-		case '\016':	/* SO */
-		case '\017':	/* SI */
+		case '\016': /* SO */
+		case '\017': /* SI */
 			/*
 			 * Different charsets are hard to handle. Applications
 			 * should use the right alt charset escapes for the
@@ -2030,24 +2288,26 @@ tputc(char *c, int len) {
 			 * rest is incompatible history st should not support.
 			 */
 			return;
-		case '\032':	/* SUB */
-		case '\030':	/* CAN */
+		case '\032': /* SUB */
+		case '\030': /* CAN */
 			csireset();
 			return;
-		case '\005':	/* ENQ (IGNORED) */
-		case '\000':	/* NUL (IGNORED) */
-		case '\021':	/* XON (IGNORED) */
-		case '\023':	/* XOFF (IGNORED) */
-		case 0177:	/* DEL (IGNORED) */
+		case '\005': /* ENQ (IGNORED) */
+		case '\000': /* NUL (IGNORED) */
+		case '\021': /* XON (IGNORED) */
+		case '\023': /* XOFF (IGNORED) */
+		case 0177:   /* DEL (IGNORED) */
 			return;
 		}
 	} else if(term.esc & ESC_START) {
 		if(term.esc & ESC_CSI) {
 			csiescseq.buf[csiescseq.len++] = ascii;
 			if(BETWEEN(ascii, 0x40, 0x7E)
-					|| csiescseq.len >= ESC_BUF_SIZ) {
+					|| csiescseq.len >= \
+					sizeof(csiescseq.buf)-1) {
 				term.esc = 0;
-				csiparse(), csihandle();
+				csiparse();
+				csihandle();
 			}
 		} else if(term.esc & ESC_STR_END) {
 			term.esc = 0;
@@ -2176,10 +2436,12 @@ tputc(char *c, int len) {
 	 */
 	if(control && !(term.c.attr.mode & ATTR_GFX))
 		return;
-	if(sel.bx != -1 && BETWEEN(term.c.y, sel.by, sel.ey))
-		sel.bx = -1;
-	if(IS_SET(MODE_WRAP) && term.c.state & CURSOR_WRAPNEXT)
-		tnewline(1); /* always go to first col */
+	if(sel.ob.x != -1 && BETWEEN(term.c.y, sel.ob.y, sel.oe.y))
+		selclear(NULL);
+	if(IS_SET(MODE_WRAP) && (term.c.state & CURSOR_WRAPNEXT)) {
+		term.line[term.c.y][term.c.x].mode |= ATTR_WRAP;
+		tnewline(1);
+	}
 
 	if(IS_SET(MODE_INSERT) && term.c.x+1 < term.col) {
 		memmove(&term.line[term.c.y][term.c.x+1],
@@ -2197,11 +2459,12 @@ tputc(char *c, int len) {
 
 int
 tresize(int col, int row) {
-	int i, x;
+	int i;
 	int minrow = MIN(row, term.row);
 	int mincol = MIN(col, term.col);
 	int slide = term.c.y - row + 1;
 	bool *bp;
+	Line *orig;
 
 	if(col < 1 || row < 1)
 		return 0;
@@ -2237,10 +2500,6 @@ tresize(int col, int row) {
 		term.dirty[i] = 1;
 		term.line[i] = xrealloc(term.line[i], col * sizeof(Glyph));
 		term.alt[i]  = xrealloc(term.alt[i],  col * sizeof(Glyph));
-		for(x = mincol; x < col; x++) {
-			term.line[i][x].state = 0;
-			term.alt[i][x].state = 0;
-		}
 	}
 
 	/* allocate any new rows */
@@ -2265,6 +2524,17 @@ tresize(int col, int row) {
 	tsetscroll(0, row-1);
 	/* make use of the LIMIT in tmoveto */
 	tmoveto(term.c.x, term.c.y);
+	/* Clearing both screens */
+	orig = term.line;
+	do {
+		if(mincol < col && 0 < minrow) {
+			tclearregion(mincol, 0, col - 1, minrow - 1);
+		}
+		if(0 < col && minrow < row) {
+			tclearregion(0, minrow, col - 1, row - 1);
+		}
+		tswapscreen();
+	} while(orig != term.line);
 
 	return (slide > 0);
 }
@@ -2274,21 +2544,22 @@ xresize(int col, int row) {
 	xw.tw = MAX(1, col * xw.cw);
 	xw.th = MAX(1, row * xw.ch);
 
-	if(!usedbe) {
-		XFreePixmap(xw.dpy, xw.buf);
-		xw.buf = XCreatePixmap(xw.dpy, xw.win, xw.w, xw.h,
-				DefaultDepth(xw.dpy, xw.scr));
-		XSetForeground(xw.dpy, dc.gc, dc.col[IS_SET(MODE_REVERSE) ? defaultfg : defaultbg].pixel);
-		XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, xw.w, xw.h);
-	}
-
+	XFreePixmap(xw.dpy, xw.buf);
+	xw.buf = XCreatePixmap(xw.dpy, xw.win, xw.w, xw.h,
+			DefaultDepth(xw.dpy, xw.scr));
 	XftDrawChange(xw.draw, xw.buf);
+	xclear(0, 0, xw.w, xw.h);
+}
+
+static inline ushort
+sixd_to_16bit(int x) {
+	return x == 0 ? 0 : 0x3737 + 0x2828 * x;
 }
 
 void
 xloadcols(void) {
 	int i, r, g, b;
-	XRenderColor color = { .alpha = 0 };
+	XRenderColor color = { .alpha = 0xffff };
 
 	/* load colors [0-15] colors and [256-LEN(colorname)[ (config.h) */
 	for(i = 0; i < MAX_COLORS; i++) {
@@ -2303,9 +2574,9 @@ xloadcols(void) {
 	for(i = 16, r = 0; r < 6; r++) {
 		for(g = 0; g < 6; g++) {
 			for(b = 0; b < 6; b++) {
-				color.red = r == 0 ? 0 : 0x3737 + 0x2828 * r;
-				color.green = g == 0 ? 0 : 0x3737 + 0x2828 * g;
-				color.blue = b == 0 ? 0 : 0x3737 + 0x2828 * b;
+				color.red = sixd_to_16bit(r);
+				color.green = sixd_to_16bit(g);
+				color.blue = sixd_to_16bit(b);
 				if(!XftColorAllocValue(xw.dpy, xw.vis, xw.cmap, &color, &dc.col[i])) {
 					die("Could not allocate color %d\n", i);
 				}
@@ -2321,6 +2592,38 @@ xloadcols(void) {
 			die("Could not allocate color %d\n", i);
 		}
 	}
+}
+
+int
+xsetcolorname(int x, const char *name) {
+	XRenderColor color = { .alpha = 0xffff };
+	Colour colour;
+	if (x < 0 || x > LEN(colorname))
+		return -1;
+	if(!name) {
+		if(16 <= x && x < 16 + 216) {
+			int r = (x - 16) / 36, g = ((x - 16) % 36) / 6, b = (x - 16) % 6;
+			color.red = sixd_to_16bit(r);
+			color.green = sixd_to_16bit(g);
+			color.blue = sixd_to_16bit(b);
+			if(!XftColorAllocValue(xw.dpy, xw.vis, xw.cmap, &color, &colour))
+				return 0; /* something went wrong */
+			dc.col[x] = colour;
+			return 1;
+		} else if (16 + 216 <= x && x < 256) {
+			color.red = color.green = color.blue = 0x0808 + 0x0a0a * (x - (16 + 216));
+			if(!XftColorAllocValue(xw.dpy, xw.vis, xw.cmap, &color, &colour))
+				return 0; /* something went wrong */
+			dc.col[x] = colour;
+			return 1;
+		} else {
+			name = colorname[x];
+		}
+	}
+	if(!XftColorAllocName(xw.dpy, xw.vis, xw.cmap, name, &colour))
+		return 0;
+	dc.col[x] = colour;
+	return 1;
 }
 
 void
@@ -2377,16 +2680,12 @@ xloadfont(Font *f, FcPattern *pattern) {
 	if(!match)
 		return 1;
 
-	if(!(f->set = FcFontSort(0, match, FcTrue, 0, &result))) {
-		FcPatternDestroy(match);
-		return 1;
-	}
-
 	if(!(f->match = XftFontOpenPattern(xw.dpy, match))) {
 		FcPatternDestroy(match);
 		return 1;
 	}
 
+	f->set = NULL;
 	f->pattern = FcPatternDuplicate(pattern);
 
 	f->ascent = f->match->ascent;
@@ -2394,7 +2693,7 @@ xloadfont(Font *f, FcPattern *pattern) {
 	f->lbearing = 0;
 	f->rbearing = f->match->max_advance_width;
 
-	f->height = f->match->height;
+	f->height = f->ascent + f->descent;
 	f->width = f->lbearing + f->rbearing;
 
 	return 0;
@@ -2439,51 +2738,55 @@ xloadfonts(char *fontstr, int fontsize) {
 	xw.cw = dc.font.width;
 	xw.ch = dc.font.height + 1;
 
-	FcPatternDel(pattern, FC_WEIGHT);
-	FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_BOLD);
-	if(xloadfont(&dc.bfont, pattern))
-		die("st: can't open font %s\n", fontstr);
-
 	FcPatternDel(pattern, FC_SLANT);
 	FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ITALIC);
+	if(xloadfont(&dc.ifont, pattern))
+		die("st: can't open font %s\n", fontstr);
+
+	FcPatternDel(pattern, FC_WEIGHT);
+	FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_BOLD);
 	if(xloadfont(&dc.ibfont, pattern))
 		die("st: can't open font %s\n", fontstr);
 
-	FcPatternDel(pattern, FC_WEIGHT);
-	if(xloadfont(&dc.ifont, pattern))
+	FcPatternDel(pattern, FC_SLANT);
+	FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ROMAN);
+	if(xloadfont(&dc.bfont, pattern))
 		die("st: can't open font %s\n", fontstr);
 
 	FcPatternDestroy(pattern);
 }
 
+int
+xloadfontset(Font *f) {
+	FcResult result;
+
+	if(!(f->set = FcFontSort(0, f->pattern, FcTrue, 0, &result)))
+		return 1;
+	return 0;
+}
+
+void
+xunloadfont(Font *f) {
+	XftFontClose(xw.dpy, f->match);
+	FcPatternDestroy(f->pattern);
+	if(f->set)
+		FcFontSetDestroy(f->set);
+}
+
 void
 xunloadfonts(void) {
-	int i, ip;
+	int i;
 
-	/*
-	 * Free the loaded fonts in the font cache. This is done backwards
-	 * from the frccur.
-	 */
-	for (i = 0, ip = frccur; i < frclen; i++, ip--) {
-		if (ip < 0)
-			ip = LEN(frc) - 1;
-		XftFontClose(xw.dpy, frc[ip].font);
+	/* Free the loaded fonts in the font cache.  */
+	for(i = 0; i < frclen; i++) {
+		XftFontClose(xw.dpy, frc[i].font);
 	}
-	frccur = -1;
 	frclen = 0;
 
-	XftFontClose(xw.dpy, dc.font.match);
-	FcPatternDestroy(dc.font.pattern);
-	FcFontSetDestroy(dc.font.set);
-	XftFontClose(xw.dpy, dc.bfont.match);
-	FcPatternDestroy(dc.bfont.pattern);
-	FcFontSetDestroy(dc.bfont.set);
-	XftFontClose(xw.dpy, dc.ifont.match);
-	FcPatternDestroy(dc.ifont.pattern);
-	FcFontSetDestroy(dc.ifont.set);
-	XftFontClose(xw.dpy, dc.ibfont.match);
-	FcPatternDestroy(dc.ibfont.pattern);
-	FcFontSetDestroy(dc.ibfont.set);
+	xunloadfont(&dc.font);
+	xunloadfont(&dc.bfont);
+	xunloadfont(&dc.ifont);
+	xunloadfont(&dc.ibfont);
 }
 
 void
@@ -2496,11 +2799,10 @@ xzoom(const Arg *arg) {
 
 void
 xinit(void) {
-	XSetWindowAttributes attrs;
 	XGCValues gcvalues;
 	Cursor cursor;
 	Window parent;
-	int sw, sh, major, minor;
+	int sw, sh;
 
 	if(!(xw.dpy = XOpenDisplay(NULL)))
 		die("Can't open display\n");
@@ -2508,7 +2810,7 @@ xinit(void) {
 	xw.vis = XDefaultVisual(xw.dpy, xw.scr);
 
 	/* font */
-	if (!FcInit())
+	if(!FcInit())
 		die("Could not init fontconfig.\n");
 
 	usedfont = (opt_font == NULL)? font : opt_font;
@@ -2538,49 +2840,35 @@ xinit(void) {
 	}
 
 	/* Events */
-	attrs.background_pixel = dc.col[defaultbg].pixel;
-	attrs.border_pixel = dc.col[defaultbg].pixel;
-	attrs.bit_gravity = NorthWestGravity;
-	attrs.event_mask = FocusChangeMask | KeyPressMask
+	xw.attrs.background_pixel = dc.col[defaultbg].pixel;
+	xw.attrs.border_pixel = dc.col[defaultbg].pixel;
+	xw.attrs.bit_gravity = NorthWestGravity;
+	xw.attrs.event_mask = FocusChangeMask | KeyPressMask
 		| ExposureMask | VisibilityChangeMask | StructureNotifyMask
 		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
-	attrs.colormap = xw.cmap;
+	xw.attrs.colormap = xw.cmap;
 
 	parent = opt_embed ? strtol(opt_embed, NULL, 0) : \
 			XRootWindow(xw.dpy, xw.scr);
 	xw.win = XCreateWindow(xw.dpy, parent, xw.fx, xw.fy,
 			xw.w, xw.h, 0, XDefaultDepth(xw.dpy, xw.scr), InputOutput,
-			xw.vis,
-			CWBackPixel | CWBorderPixel | CWBitGravity | CWEventMask
-			| CWColormap,
-			&attrs);
+			xw.vis, CWBackPixel | CWBorderPixel | CWBitGravity
+			| CWEventMask | CWColormap, &xw.attrs);
 
-	/* double buffering */
-	/*
-	if(XdbeQueryExtension(xw.dpy, &major, &minor)) {
-		xw.buf = XdbeAllocateBackBufferName(xw.dpy, xw.win,
-				XdbeBackground);
-		usedbe = True;
-	} else {
-	*/
-		memset(&gcvalues, 0, sizeof(gcvalues));
-		gcvalues.graphics_exposures = False;
-		dc.gc = XCreateGC(xw.dpy, parent, GCGraphicsExposures,
-				&gcvalues);
-		xw.buf = XCreatePixmap(xw.dpy, xw.win, xw.w, xw.h,
-				DefaultDepth(xw.dpy, xw.scr));
-		XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
-		XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, xw.w, xw.h);
-		//xw.buf = xw.win;
-	/*
-	}
-	*/
+	memset(&gcvalues, 0, sizeof(gcvalues));
+	gcvalues.graphics_exposures = False;
+	dc.gc = XCreateGC(xw.dpy, parent, GCGraphicsExposures,
+			&gcvalues);
+	xw.buf = XCreatePixmap(xw.dpy, xw.win, xw.w, xw.h,
+			DefaultDepth(xw.dpy, xw.scr));
+	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
+	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, xw.w, xw.h);
 
 	/* Xft rendering context */
 	xw.draw = XftDrawCreate(xw.dpy, xw.buf, xw.vis, xw.cmap);
 
 	/* input methods */
-	if((xw.xim =  XOpenIM(xw.dpy, NULL, NULL, NULL)) == NULL) {
+	if((xw.xim = XOpenIM(xw.dpy, NULL, NULL, NULL)) == NULL) {
 		XSetLocaleModifiers("@im=local");
 		if((xw.xim =  XOpenIM(xw.dpy, NULL, NULL, NULL)) == NULL) {
 			XSetLocaleModifiers("@im=");
@@ -2618,7 +2906,7 @@ void
 xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 	int winx = borderpx + x * xw.cw, winy = borderpx + y * xw.ch,
 	    width = charlen * xw.cw, xp, i;
-	int frp, frcflags;
+	int frcflags;
 	int u8fl, u8fblen, u8cblen, doesexist;
 	char *u8c, *u8fs;
 	long u8char;
@@ -2627,11 +2915,28 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 	FcPattern *fcpattern, *fontpattern;
 	FcFontSet *fcsets[] = { NULL };
 	FcCharSet *fccharset;
-	Colour *fg = &dc.col[base.fg], *bg = &dc.col[base.bg],
-		 *temp, revfg, revbg;
+	Colour *fg, *bg, *temp, revfg, revbg;
 	XRenderColor colfg, colbg;
+	Rectangle r;
 
 	frcflags = FRC_NORMAL;
+
+	if(base.mode & ATTR_ITALIC) {
+		if(base.fg == defaultfg)
+			base.fg = defaultitalic;
+		font = &dc.ifont;
+		frcflags = FRC_ITALIC;
+	} else if((base.mode & ATTR_ITALIC) && (base.mode & ATTR_BOLD)) {
+		if(base.fg == defaultfg)
+			base.fg = defaultitalic;
+		font = &dc.ibfont;
+		frcflags = FRC_ITALICBOLD;
+	} else if(base.mode & ATTR_UNDERLINE) {
+		if(base.fg == defaultfg)
+			base.fg = defaultunderline;
+	}
+	fg = &dc.col[base.fg];
+	bg = &dc.col[base.bg];
 
 	if(base.mode & ATTR_BOLD) {
 		if(BETWEEN(base.fg, 0, 7)) {
@@ -2646,21 +2951,12 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 		}
 		/*
 		 * Those ranges will not be brightened:
-		 *	8 - 15 – bright system colors
-		 *	196 - 231 – highest 256 color cube
-		 *	252 - 255 – brightest colors in greyscale
+		 *    8 - 15 – bright system colors
+		 *    196 - 231 – highest 256 color cube
+		 *    252 - 255 – brightest colors in greyscale
 		 */
 		font = &dc.bfont;
 		frcflags = FRC_BOLD;
-	}
-
-	if(base.mode & ATTR_ITALIC) {
-		font = &dc.ifont;
-		frcflags = FRC_ITALIC;
-	}
-	if((base.mode & ATTR_ITALIC) && (base.mode & ATTR_BOLD)) {
-		font = &dc.ibfont;
-		frcflags = FRC_ITALICBOLD;
 	}
 
 	if(IS_SET(MODE_REVERSE)) {
@@ -2693,6 +2989,9 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 		bg = temp;
 	}
 
+	if(base.mode & ATTR_BLINK && term.mode & MODE_BLINK)
+		fg = bg;
+
 	/* Intelligent cleaning up of the borders. */
 	if(x == 0) {
 		xclear(0, (y == 0)? 0 : winy, borderpx,
@@ -2710,8 +3009,14 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 	/* Clean up the region we want to draw to. */
 	XftDrawRect(xw.draw, bg, winx, winy, width, xw.ch);
 
-	fcsets[0] = font->set;
-	for (xp = winx; bytelen > 0;) {
+	/* Set the clip region because Xft is sometimes dirty. */
+	r.x = 0;
+	r.y = 0;
+	r.height = xw.ch;
+	r.width = width;
+	XftDrawSetClipRectangles(xw.draw, winx, winy, &r, 1);
+
+	for(xp = winx; bytelen > 0;) {
 		/*
 		 * Search for the range in the to be printed string of glyphs
 		 * that are in the main font. Then print that range. If
@@ -2721,28 +3026,29 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 		u8fs = s;
 		u8fblen = 0;
 		u8fl = 0;
-		for (;;) {
+		for(;;) {
 			u8c = s;
 			u8cblen = utf8decode(s, &u8char);
 			s += u8cblen;
 			bytelen -= u8cblen;
 
-			doesexist = XftCharIndex(xw.dpy, font->match, u8char);
-			if (!doesexist || bytelen <= 0) {
-				if (bytelen <= 0) {
-					if (doesexist) {
+			doesexist = XftCharExists(xw.dpy, font->match, u8char);
+			if(!doesexist || bytelen <= 0) {
+				if(bytelen <= 0) {
+					if(doesexist) {
 						u8fl++;
 						u8fblen += u8cblen;
 					}
 				}
 
-				if (u8fl > 0) {
+				if(u8fl > 0) {
 					XftDrawStringUtf8(xw.draw, fg,
 							font->match, xp,
 							winy + font->ascent,
 							(FcChar8 *)u8fs,
 							u8fblen);
 					xp += font->width * u8fl;
+
 				}
 				break;
 			}
@@ -2750,23 +3056,23 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 			u8fl++;
 			u8fblen += u8cblen;
 		}
-		if (doesexist)
+		if(doesexist)
 			break;
 
-		frp = frccur;
 		/* Search the font cache. */
-		for (i = 0; i < frclen; i++, frp--) {
-			if (frp <= 0)
-				frp = LEN(frc) - 1;
-
-			if (frc[frp].c == u8char
-					&& frc[frp].flags == frcflags) {
+		for(i = 0; i < frclen; i++) {
+			if(XftCharExists(xw.dpy, frc[i].font, u8char)
+					&& frc[i].flags == frcflags) {
 				break;
 			}
 		}
 
 		/* Nothing was found. */
-		if (i >= frclen) {
+		if(i >= frclen) {
+			if(!font->set)
+				xloadfontset(font);
+			fcsets[0] = font->set;
+
 			/*
 			 * Nothing was found in the cache. Now use
 			 * some dozen of Fontconfig calls to get the
@@ -2789,31 +3095,26 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 					FcTrue, fcpattern, &fcres);
 
 			/*
-			 * Overwrite or create the new cache entry
-			 * entry.
+			 * Overwrite or create the new cache entry.
 			 */
-			frccur++;
-			frclen++;
-			if (frccur >= LEN(frc))
-				frccur = 0;
-			if (frclen > LEN(frc)) {
-				frclen = LEN(frc);
-				XftFontClose(xw.dpy, frc[frccur].font);
+			if(frclen >= LEN(frc)) {
+				frclen = LEN(frc) - 1;
+				XftFontClose(xw.dpy, frc[frclen].font);
 			}
 
-			frc[frccur].font = XftFontOpenPattern(xw.dpy,
+			frc[frclen].font = XftFontOpenPattern(xw.dpy,
 					fontpattern);
-			frc[frccur].c = u8char;
-			frc[frccur].flags = frcflags;
+			frc[frclen].flags = frcflags;
+
+			i = frclen;
+			frclen++;
 
 			FcPatternDestroy(fcpattern);
 			FcCharSetDestroy(fccharset);
-
-			frp = frccur;
 		}
 
-		XftDrawStringUtf8(xw.draw, fg, frc[frp].font,
-				xp, winy + frc[frp].font->ascent,
+		XftDrawStringUtf8(xw.draw, fg, frc[i].font,
+				xp, winy + frc[i].font->ascent,
 				(FcChar8 *)u8c, u8cblen);
 
 		xp += font->width;
@@ -2828,46 +3129,73 @@ xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen) {
 		XftDrawRect(xw.draw, fg, winx, winy + font->ascent + 1,
 				width, 1);
 	}
+
+	/* Reset clip to none. */
+	XftDrawSetClip(xw.draw, 0);
 }
 
 void
 xdrawcursor(void) {
 	static int oldx = 0, oldy = 0;
 	int sl;
-	Glyph g = {{' '}, ATTR_NULL, defaultbg, defaultcs, 0};
+	Glyph g = {{' '}, ATTR_NULL, defaultbg, defaultcs};
 
 	LIMIT(oldx, 0, term.col-1);
 	LIMIT(oldy, 0, term.row-1);
 
-	if(term.line[term.c.y][term.c.x].state & GLYPH_SET)
-		memcpy(g.c, term.line[term.c.y][term.c.x].c, UTF_SIZ);
+	memcpy(g.c, term.line[term.c.y][term.c.x].c, UTF_SIZ);
 
 	/* remove the old cursor */
-	if(term.line[oldy][oldx].state & GLYPH_SET) {
-		sl = utf8size(term.line[oldy][oldx].c);
-		xdraws(term.line[oldy][oldx].c, term.line[oldy][oldx], oldx,
-				oldy, 1, sl);
-	} else {
-		xtermclear(oldx, oldy, oldx, oldy);
-	}
+	sl = utf8size(term.line[oldy][oldx].c);
+	xdraws(term.line[oldy][oldx].c, term.line[oldy][oldx], oldx,
+			oldy, 1, sl);
 
 	/* draw the new one */
 	if(!(IS_SET(MODE_HIDE))) {
-		if(!(xw.state & WIN_FOCUSED))
-			g.bg = defaultucs;
+		if(xw.state & WIN_FOCUSED) {
+			if(IS_SET(MODE_REVERSE)) {
+				g.mode |= ATTR_REVERSE;
+				g.fg = defaultcs;
+				g.bg = defaultfg;
+			}
 
-		if(IS_SET(MODE_REVERSE))
-			g.mode |= ATTR_REVERSE, g.fg = defaultcs, g.bg = defaultfg;
-
-		sl = utf8size(g.c);
-		xdraws(g.c, g, term.c.x, term.c.y, 1, sl);
+			sl = utf8size(g.c);
+			xdraws(g.c, g, term.c.x, term.c.y, 1, sl);
+		} else {
+			XftDrawRect(xw.draw, &dc.col[defaultcs],
+					borderpx + term.c.x * xw.cw,
+					borderpx + term.c.y * xw.ch,
+					xw.cw - 1, 1);
+			XftDrawRect(xw.draw, &dc.col[defaultcs],
+					borderpx + term.c.x * xw.cw,
+					borderpx + term.c.y * xw.ch,
+					1, xw.ch - 1);
+			XftDrawRect(xw.draw, &dc.col[defaultcs],
+					borderpx + (term.c.x + 1) * xw.cw - 1,
+					borderpx + term.c.y * xw.ch,
+					1, xw.ch - 1);
+			XftDrawRect(xw.draw, &dc.col[defaultcs],
+					borderpx + term.c.x * xw.cw,
+					borderpx + (term.c.y + 1) * xw.ch - 1,
+					xw.cw, 1);
+		}
 		oldx = term.c.x, oldy = term.c.y;
 	}
 }
 
+
+void
+xsettitle(char *p) {
+	XTextProperty prop;
+
+	Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
+			&prop);
+	XSetWMName(xw.dpy, xw.win, &prop);
+}
+
 void
 xresettitle(void) {
-	XStoreName(xw.dpy, xw.win, opt_title ? opt_title : "st");
+	xsettitle(opt_title ? opt_title : "st");
 }
 
 void
@@ -2885,16 +3213,12 @@ redraw(int timeout) {
 
 void
 draw(void) {
-	XdbeSwapInfo swpinfo[1] = {{xw.win, XdbeCopied}};
-
 	drawregion(0, 0, term.col, term.row);
-	if(usedbe) {
-		XdbeSwapBuffers(xw.dpy, swpinfo, 1);
-	} else {
-		XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, xw.w,
-				xw.h, 0, 0);
-		XSetForeground(xw.dpy, dc.gc, dc.col[IS_SET(MODE_REVERSE) ? defaultfg : defaultbg].pixel);
-	}
+	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, xw.w,
+			xw.h, 0, 0);
+	XSetForeground(xw.dpy, dc.gc,
+			dc.col[IS_SET(MODE_REVERSE)?
+				defaultfg : defaultbg].pixel);
 }
 
 void
@@ -2902,7 +3226,7 @@ drawregion(int x1, int y1, int x2, int y2) {
 	int ic, ib, x, y, ox, sl;
 	Glyph base, new;
 	char buf[DRAW_BUF_SIZ];
-	bool ena_sel = sel.bx != -1;
+	bool ena_sel = sel.ob.x != -1;
 
 	if(sel.alt ^ IS_SET(MODE_ALTSCREEN))
 		ena_sel = 0;
@@ -2920,25 +3244,22 @@ drawregion(int x1, int y1, int x2, int y2) {
 		ic = ib = ox = 0;
 		for(x = x1; x < x2; x++) {
 			new = term.line[y][x];
-			if(ena_sel && *(new.c) && selected(x, y))
+			if(ena_sel && selected(x, y))
 				new.mode ^= ATTR_REVERSE;
-			if(ib > 0 && (!(new.state & GLYPH_SET)
-					|| ATTRCMP(base, new)
+			if(ib > 0 && (ATTRCMP(base, new)
 					|| ib >= DRAW_BUF_SIZ-UTF_SIZ)) {
 				xdraws(buf, base, ox, y, ic, ib);
 				ic = ib = 0;
 			}
-			if(new.state & GLYPH_SET) {
-				if(ib == 0) {
-					ox = x;
-					base = new;
-				}
-
-				sl = utf8size(new.c);
-				memcpy(buf+ib, new.c, sl);
-				ib += sl;
-				++ic;
+			if(ib == 0) {
+				ox = x;
+				base = new;
 			}
+
+			sl = utf8size(new.c);
+			memcpy(buf+ib, new.c, sl);
+			ib += sl;
+			++ic;
 		}
 		if(ib > 0)
 			xdraws(buf, base, ox, y, ic, ib);
@@ -2975,6 +3296,12 @@ unmap(XEvent *ev) {
 }
 
 void
+xsetpointermotion(int set) {
+	MODBIT(xw.attrs.event_mask, set, PointerMotionMask);
+	XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask, &xw.attrs);
+}
+
+void
 xseturgency(int add) {
 	XWMHints *h = XGetWMHints(xw.dpy, xw.win);
 
@@ -2994,21 +3321,27 @@ focus(XEvent *ev) {
 		XSetICFocus(xw.xic);
 		xw.state |= WIN_FOCUSED;
 		xseturgency(0);
+		if(IS_SET(MODE_FOCUS))
+			ttywrite("\033[I", 3);
 	} else {
 		XUnsetICFocus(xw.xic);
 		xw.state &= ~WIN_FOCUSED;
+		if(IS_SET(MODE_FOCUS))
+			ttywrite("\033[O", 3);
 	}
 }
 
-bool
+static inline bool
 match(uint mask, uint state) {
+	state &= ~ignoremod;
+
 	if(mask == XK_NO_MOD && state)
 		return false;
 	if(mask != XK_ANY_MOD && mask != XK_NO_MOD && !state)
 		return false;
-	if((state & mask) != state)
-		return false;
-	return true;
+	if(mask == XK_ANY_MOD)
+		return true;
+	return state == mask;
 }
 
 void
@@ -3018,7 +3351,6 @@ numlock(const Arg *dummy) {
 
 char*
 kmap(KeySym k, uint state) {
-	uint mask;
 	Key *kp;
 	int i;
 
@@ -3033,12 +3365,10 @@ kmap(KeySym k, uint state) {
 	}
 
 	for(kp = key; kp < key + LEN(key); kp++) {
-		mask = kp->mask;
-
 		if(kp->k != k)
 			continue;
 
-		if(!match(mask, state))
+		if(!match(kp->mask, state))
 			continue;
 
 		if(kp->appkey > 0) {
@@ -3072,11 +3402,12 @@ kpress(XEvent *ev) {
 	XKeyEvent *e = &ev->xkey;
 	KeySym ksym;
 	char xstr[31], buf[32], *customkey, *cp = buf;
-	int len;
+	int len, ret;
+	long c;
 	Status status;
 	Shortcut *bp;
 
-	if (IS_SET(MODE_KBDLOCK))
+	if(IS_SET(MODE_KBDLOCK))
 		return;
 
 	len = XmbLookupString(xw.xic, e, xstr, sizeof(xstr), &ksym, &status);
@@ -3093,13 +3424,23 @@ kpress(XEvent *ev) {
 	if((customkey = kmap(ksym, e->state))) {
 		len = strlen(customkey);
 		memcpy(buf, customkey, len);
-	/* 2. hardcoded (overrides X lookup) */
+	/* 3. hardcoded (overrides X lookup) */
 	} else {
 		if(len == 0)
 			return;
 
-		if (len == 1 && e->state & Mod1Mask)
-			*cp++ = '\033';
+		if(len == 1 && e->state & Mod1Mask) {
+			if(IS_SET(MODE_8BIT)) {
+				if(*xstr < 0177) {
+					c = *xstr | 0x80;
+					ret = utf8encode(&c, cp);
+					cp += ret;
+					len = 0;
+				}
+			} else {
+				*cp++ = '\033';
+			}
+		}
 
 		memcpy(cp, xstr, len);
 		len = cp - buf + len;
@@ -3159,124 +3500,181 @@ resize(XEvent *e) {
 void
 run(void) {
 	XEvent ev;
+	int w = xw.w, h = xw.h;
 	fd_set rfd;
-	int xfd = XConnectionNumber(xw.dpy), i;
-	struct timeval drawtimeout, *tv = NULL;
+	int xfd = XConnectionNumber(xw.dpy), xev, blinkset = 0, dodraw = 0;
+	struct timeval drawtimeout, *tv = NULL, now, last, lastblink;
 
-	for(i = 0;; i++) {
+	/* Waiting for window mapping */
+	while(1) {
+		XNextEvent(xw.dpy, &ev);
+		if(ev.type == ConfigureNotify) {
+			w = ev.xconfigure.width;
+			h = ev.xconfigure.height;
+		} else if(ev.type == MapNotify) {
+			break;
+		}
+	}
+
+	if(!xw.isfixed)
+		cresize(w, h);
+	else
+		cresize(xw.fw, xw.fh);
+	ttynew();
+
+	gettimeofday(&lastblink, NULL);
+	gettimeofday(&last, NULL);
+
+	for(xev = actionfps;;) {
 		FD_ZERO(&rfd);
 		FD_SET(cmdfd, &rfd);
 		FD_SET(xfd, &rfd);
+
 		if(select(MAX(xfd, cmdfd)+1, &rfd, NULL, NULL, tv) < 0) {
 			if(errno == EINTR)
 				continue;
 			die("select failed: %s\n", SERRNO);
 		}
-
-		/*
-		 * Stop after a certain number of reads so the user does not
-		 * feel like the system is stuttering.
-		 */
-		if(i < 1000 && FD_ISSET(cmdfd, &rfd)) {
+		if(FD_ISSET(cmdfd, &rfd)) {
 			ttyread();
-
-			/*
-			 * Just wait a bit so it isn't disturbing the
-			 * user and the system is able to write something.
-			 */
-			drawtimeout.tv_sec = 0;
-			drawtimeout.tv_usec = 5;
-			tv = &drawtimeout;
-			continue;
-		}
-		i = 0;
-		tv = NULL;
-
-		while(XPending(xw.dpy)) {
-			XNextEvent(xw.dpy, &ev);
-			if(XFilterEvent(&ev, None))
-				continue;
-			if(handler[ev.type])
-				(handler[ev.type])(&ev);
+			if(blinktimeout) {
+				blinkset = tattrset(ATTR_BLINK);
+				if(!blinkset && term.mode & ATTR_BLINK)
+					term.mode &= ~(MODE_BLINK);
+			}
 		}
 
-		draw();
-		XFlush(xw.dpy);
+		if(FD_ISSET(xfd, &rfd))
+			xev = actionfps;
+
+		gettimeofday(&now, NULL);
+		drawtimeout.tv_sec = 0;
+		drawtimeout.tv_usec = (1000/xfps) * 1000;
+		tv = &drawtimeout;
+
+		dodraw = 0;
+		if(blinktimeout && TIMEDIFF(now, lastblink) > blinktimeout) {
+			tsetdirtattr(ATTR_BLINK);
+			term.mode ^= MODE_BLINK;
+			gettimeofday(&lastblink, NULL);
+			dodraw = 1;
+		}
+		if(TIMEDIFF(now, last) \
+				> (xev? (1000/xfps) : (1000/actionfps))) {
+			dodraw = 1;
+			last = now;
+		}
+
+		if(dodraw) {
+			while(XPending(xw.dpy)) {
+				XNextEvent(xw.dpy, &ev);
+				if(XFilterEvent(&ev, None))
+					continue;
+				if(handler[ev.type])
+					(handler[ev.type])(&ev);
+			}
+
+			draw();
+			XFlush(xw.dpy);
+
+			if(xev && !FD_ISSET(xfd, &rfd))
+				xev--;
+			if(!FD_ISSET(cmdfd, &rfd) && !FD_ISSET(xfd, &rfd)) {
+				if(blinkset) {
+					if(TIMEDIFF(now, lastblink) \
+							> blinktimeout) {
+						drawtimeout.tv_usec = 1;
+					} else {
+						drawtimeout.tv_usec = (1000 * \
+							(blinktimeout - \
+							TIMEDIFF(now,
+								lastblink)));
+					}
+				} else {
+					tv = NULL;
+				}
+			}
+		}
 	}
+}
+
+void
+usage(void) {
+	die("%s " VERSION " (c) 2010-2013 st engineers\n" \
+	"usage: st [-a] [-v] [-c class] [-f font] [-g geometry] [-o file]" \
+	" [-t title] [-w windowid] [-e command ...]\n", argv0);
 }
 
 int
 main(int argc, char *argv[]) {
-	int i, bitm, xr, yr;
+	int bitm, xr, yr;
 	uint wr, hr;
+	char *titles;
 
 	xw.fw = xw.fh = xw.fx = xw.fy = 0;
 	xw.isfixed = False;
 	colorname = colorname_light;
 
-	for(i = 1; i < argc; i++) {
-		switch(argv[i][0] != '-' || argv[i][2] ? -1 : argv[i][1]) {
-		case 'c':
-			if(++i < argc)
-				opt_class = argv[i];
-			break;
-		case 'e':
-			/* eat all remaining arguments */
-			if(++i < argc)
-				opt_cmd = &argv[i];
-			goto run;
-		case 'f':
-			if(++i < argc)
-				opt_font = argv[i];
-			break;
-		case 'g':
-			if(++i >= argc)
-				break;
-
-			bitm = XParseGeometry(argv[i], &xr, &yr, &wr, &hr);
-			if(bitm & XValue)
-				xw.fx = xr;
-			if(bitm & YValue)
-				xw.fy = yr;
-			if(bitm & WidthValue)
-				xw.fw = (int)wr;
-			if(bitm & HeightValue)
-				xw.fh = (int)hr;
-			if(bitm & XNegative && xw.fx == 0)
-				xw.fx = -1;
-			if(bitm & XNegative && xw.fy == 0)
-				xw.fy = -1;
-
-			if(xw.fh != 0 && xw.fw != 0)
-				xw.isfixed = True;
-			break;
-		case 'o':
-			if(++i < argc)
-				opt_io = argv[i];
-			break;
-		case 't':
-			if(++i < argc)
-				opt_title = argv[i];
-			break;
-		case 'd':
-			colorname = colorname_dark;
-			break;
-		case 'v':
-		default:
-			die(USAGE);
-		case 'w':
-			if(++i < argc)
-				opt_embed = argv[i];
-			break;
+	ARGBEGIN {
+	case 'a':
+		allowaltscreen = false;
+		break;
+	case 'c':
+		opt_class = EARGF(usage());
+		break;
+	case 'e':
+		/* eat all remaining arguments */
+		if(argc > 1) {
+			opt_cmd = &argv[1];
+			if(argv[1] != NULL && opt_title == NULL) {
+				titles = strdup(argv[1]);
+				opt_title = basename(titles);
+			}
 		}
-	}
+		goto run;
+	case 'f':
+		opt_font = EARGF(usage());
+		break;
+	case 'g':
+		bitm = XParseGeometry(EARGF(usage()), &xr, &yr, &wr, &hr);
+		if(bitm & XValue)
+			xw.fx = xr;
+		if(bitm & YValue)
+			xw.fy = yr;
+		if(bitm & WidthValue)
+			xw.fw = (int)wr;
+		if(bitm & HeightValue)
+			xw.fh = (int)hr;
+		if(bitm & XNegative && xw.fx == 0)
+			xw.fx = -1;
+		if(bitm & XNegative && xw.fy == 0)
+			xw.fy = -1;
+
+		if(xw.fh != 0 && xw.fw != 0)
+			xw.isfixed = True;
+		break;
+	case 'd':
+		colorname = colorname_dark;
+		break;
+	case 'o':
+		opt_io = EARGF(usage());
+		break;
+	case 't':
+		opt_title = EARGF(usage());
+		break;
+	case 'w':
+		opt_embed = EARGF(usage());
+		break;
+	case 'v':
+	default:
+		usage();
+	} ARGEND;
 
 run:
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
 	tnew(80, 24);
 	xinit();
-	ttynew();
 	selinit();
 	run();
 

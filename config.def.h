@@ -12,9 +12,29 @@ static char shell[] = "/bin/sh";
 #define DEFAULT_FONT_SIZE 16
 /* #define SOLARIZED_DARK */
 
-/* double-click timeout (in milliseconds) between clicks for selection */
+/*
+ * word delimiter string
+ *
+ * More advanced example: " `'\"()[]{}"
+ */
+static char worddelimiters[] = " ";
+
+/* selection timeouts (in milliseconds) */
 static unsigned int doubleclicktimeout = 300;
 static unsigned int tripleclicktimeout = 600;
+
+/* alt screens */
+static bool allowaltscreen = true;
+
+/* frames per second st should at maximum draw to the screen */
+static unsigned int xfps = 120;
+static unsigned int actionfps = 30;
+
+/*
+ * blinking timeout (set to 0 to disable blinking) for the terminal blinking
+ * attribute.
+ */
+static unsigned int blinktimeout = 800;
 
 /* TERM value */
 static char termname[] = "st-256color";
@@ -101,14 +121,29 @@ static const char *colorname_light[] = {
 
 /*
  * Default colors (colorname index)
- * foreground, background, cursor, unfocused cursor
+ * foreground, background, cursor
  */
 static unsigned int defaultfg = 12;
 static unsigned int defaultbg = 8;
 static unsigned int defaultcs = 10;
-static unsigned int defaultucs = 0;
 
-/* Internal shortcuts. */
+/*
+ * Colors used, when the specific fg == defaultfg. So in reverse mode this
+ * will reverse too. Another logic would only make the simple feature too
+ * complex.
+ */
+static unsigned int defaultitalic = 11;
+static unsigned int defaultunderline = 7;
+
+/* Internal mouse shortcuts. */
+/* Beware that overloading Button1 will disable the selection. */
+static Mousekey mshortcuts[] = {
+	/* keysym		mask		string */
+	{ Button4,		XK_ANY_MOD,	"\031"},
+	{ Button5,		XK_ANY_MOD,	"\005"},
+};
+
+/* Internal keyboard shortcuts. */
 #define MODKEY Mod1Mask
 
 static Shortcut shortcuts[] = {
@@ -116,6 +151,7 @@ static Shortcut shortcuts[] = {
 	{ MODKEY|ShiftMask,	XK_Prior,	xzoom,		{.i = +1} },
 	{ MODKEY|ShiftMask,	XK_Next,	xzoom,		{.i = -1} },
 	{ ShiftMask,		XK_Insert,	selpaste,	{.i =  0} },
+	{ MODKEY|ShiftMask,	XK_Insert,	clippaste,	{.i =  0} },
 	{ MODKEY,		XK_Num_Lock,	numlock,	{.i =  0} },
 };
 
@@ -150,6 +186,12 @@ static Shortcut shortcuts[] = {
  */
 static KeySym mappedkeys[] = { -1 };
 
+/*
+ * Which bits of the state should be ignored. By default the state bit for the
+ * keyboard layout (XK_SWITCH_MOD) is ignored.
+ */
+uint ignoremod = XK_SWITCH_MOD;
+
 /* key, mask, output, keypad, cursor, crlf */
 static Key key[] = {
 	/* keysym             mask         string         keypad cursor crlf */
@@ -169,7 +211,7 @@ static Key key[] = {
 	{ XK_KP_Right,      XK_ANY_MOD,     "\033[C",        0,   -1,    0},
 	{ XK_KP_Right,      XK_ANY_MOD,     "\033OC",        0,   +1,    0},
 	{ XK_KP_Prior,      ShiftMask,      "\033[5;2~",     0,    0,    0},
-	{ XK_KP_Prior,      XK_ANY_MOD,     "\033[5~",	     0,    0,    0},
+	{ XK_KP_Prior,      XK_ANY_MOD,     "\033[5~",       0,    0,    0},
 	{ XK_KP_Begin,      XK_ANY_MOD,     "\033[E",        0,    0,    0},
 	{ XK_KP_End,        ControlMask,    "\033[J",       -1,    0,    0},
 	{ XK_KP_End,        ControlMask,    "\033[1;5F",    +1,    0,    0},
@@ -222,7 +264,7 @@ static Key key[] = {
 	{ XK_Left,          ShiftMask,      "\033[1;2D",     0,    0,    0},
 	{ XK_Left,          ControlMask,    "\033[1;5D",     0,    0,    0},
 	{ XK_Left,          Mod1Mask,       "\033[1;3D",     0,    0,    0},
-	{ XK_Left,	    XK_ANY_MOD,     "\033[D",        0,   -1,    0},
+	{ XK_Left,          XK_ANY_MOD,     "\033[D",        0,   -1,    0},
 	{ XK_Left,          XK_ANY_MOD,     "\033OD",        0,   +1,    0},
 	{ XK_Right,         ShiftMask,      "\033[1;2C",     0,    0,    0},
 	{ XK_Right,         ControlMask,    "\033[1;5C",     0,    0,    0},
@@ -254,7 +296,10 @@ static Key key[] = {
 	{ XK_End,           ShiftMask,      "\033[K",       -1,    0,    0},
 	{ XK_End,           ShiftMask,      "\033[1;2F",    +1,    0,    0},
 	{ XK_End,           XK_ANY_MOD,     "\033[4~",       0,    0,    0},
-	{ XK_Prior,         XK_NO_MOD,      "\033[5~",       0,    0,    0},
+	{ XK_Prior,         ControlMask,    "\033[5;5~",     0,    0,    0},
+	{ XK_Prior,         ShiftMask,      "\033[5;2~",     0,    0,    0},
+	{ XK_Prior,         XK_ANY_MOD,     "\033[5~",       0,    0,    0},
+	{ XK_Next,          ControlMask,    "\033[6;5~",     0,    0,    0},
 	{ XK_Next,          ShiftMask,      "\033[6;2~",     0,    0,    0},
 	{ XK_Next,          XK_ANY_MOD,     "\033[6~",       0,    0,    0},
 	{ XK_F1,            XK_NO_MOD,      "\033OP" ,       0,    0,    0},
@@ -343,5 +388,17 @@ static Key key[] = {
 	{ XK_F33,           XK_NO_MOD,      "\033[20;5~",    0,    0,    0},
 	{ XK_F34,           XK_NO_MOD,      "\033[21;5~",    0,    0,    0},
 	{ XK_F35,           XK_NO_MOD,      "\033[23;5~",    0,    0,    0},
+};
+
+/*
+ * Selection types' masks.
+ * Use the same masks as usual.
+ * Button1Mask is always unset, to make masks match between ButtonPress.
+ * ButtonRelease and MotionNotify.
+ * If no match is found, regular selection is used.
+ */
+
+static uint selmasks[] = {
+	[SEL_RECTANGULAR] = Mod1Mask,
 };
 
