@@ -5,9 +5,12 @@
  *
  * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
  */
-static char font[] = "Liberation Mono:pixelsize=12:antialias=false:autohint=false";
+static char font[] = "Ubuntu Mono:pixelsize=16";
 static int borderpx = 2;
 static char shell[] = "/bin/sh";
+
+#define DEFAULT_FONT_SIZE 16
+/* #define SOLARIZED_DARK */
 
 /* double-click timeout (in milliseconds) between clicks for selection */
 static unsigned int doubleclicktimeout = 300;
@@ -18,34 +21,64 @@ static char termname[] = "st-256color";
 
 static unsigned int tabspaces = 8;
 
+#define S_yellow "#b58900"
+#define S_orange "#cb4b16"
+#define S_red "#dc322f"
+#define S_magenta "#d33682"
+#define S_violet "#6c71c4"
+#define S_blue "#268bd2"
+#define S_cyan "#2aa198"
+#define S_green "#859900"
+
+#ifdef SOLARIZED_DARK
+
+#define S_base03 "#002b36"
+#define S_base02 "#073642"
+#define S_base01 "#586e75"
+#define S_base00 "#657b83"
+#define S_base0 "#839496"
+#define S_base1 "#93a1a1"
+#define S_base2 "#eee8d5"
+#define S_base3 "#fdf6e3"
+
+#else
+
+#define S_base03 "#fdf6e3"
+#define S_base02 "#eee8d5"
+#define S_base01 "#93a1a1"
+#define S_base00 "#839496"
+#define S_base0 "#657b83"
+#define S_base1 "#586e75"
+#define S_base2 "#073642"
+#define S_base3 "#002b36"
+
+#endif
 
 /* Terminal colors (16 first used in escape sequence) */
 static const char *colorname[] = {
 	/* 8 normal colors */
-	"black",
-	"red3",
-	"green3",
-	"yellow3",
-	"blue2",
-	"magenta3",
-	"cyan3",
-	"gray90",
+	S_base02,
+	S_red,
+	S_green,
+	S_yellow,
+	S_blue,
+	S_magenta,
+	S_cyan,
+	S_base2,
 
 	/* 8 bright colors */
-	"gray50",
-	"red",
-	"green",
-	"yellow",
-	"#5c5cff",
-	"magenta",
-	"cyan",
-	"white",
+	S_base03,
+	S_orange,
+	S_base01,
+	S_base00,
+	S_base0,
+	S_violet,
+	S_base1,
+	S_base3,
 
 	[255] = 0,
 
 	/* more colors can be added after 255 to use with DefaultXX */
-	"#cccccc",
-	"#333333",
 };
 
 
@@ -53,10 +86,10 @@ static const char *colorname[] = {
  * Default colors (colorname index)
  * foreground, background, cursor, unfocused cursor
  */
-static unsigned int defaultfg = 7;
-static unsigned int defaultbg = 0;
-static unsigned int defaultcs = 256;
-static unsigned int defaultucs = 257;
+static unsigned int defaultfg = 12;
+static unsigned int defaultbg = 8;
+static unsigned int defaultcs = 10;
+static unsigned int defaultucs = 0;
 
 /* Internal shortcuts. */
 #define MODKEY Mod1Mask
