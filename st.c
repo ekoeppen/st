@@ -2736,7 +2736,7 @@ xloadfonts(char *fontstr, int fontsize) {
 
 	/* Setting character width and height. */
 	xw.cw = dc.font.width;
-	xw.ch = dc.font.height + 1;
+	xw.ch = dc.font.height;
 
 	FcPatternDel(pattern, FC_SLANT);
 	FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ITALIC);
