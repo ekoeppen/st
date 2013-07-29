@@ -282,7 +282,7 @@ typedef struct {
 
 /* Drawing Context */
 typedef struct {
-	Colour col[LEN(colorname) < 256 ? 256 : LEN(colorname)];
+	Colour col[MAX_COLORS];
 	Font font, bfont, ifont, ibfont;
 	GC gc;
 } DC;
@@ -414,6 +414,7 @@ static char *opt_title = NULL;
 static char *opt_embed = NULL;
 static char *opt_class = NULL;
 static char *opt_font = NULL;
+static char **colorname = NULL;
 
 bool usedbe = False;
 
@@ -2290,7 +2291,7 @@ xloadcols(void) {
 	XRenderColor color = { .alpha = 0 };
 
 	/* load colors [0-15] colors and [256-LEN(colorname)[ (config.h) */
-	for(i = 0; i < LEN(colorname); i++) {
+	for(i = 0; i < MAX_COLORS; i++) {
 		if(!colorname[i])
 			continue;
 		if(!XftColorAllocName(xw.dpy, xw.vis, xw.cmap, colorname[i], &dc.col[i])) {
@@ -3211,6 +3212,7 @@ main(int argc, char *argv[]) {
 
 	xw.fw = xw.fh = xw.fx = xw.fy = 0;
 	xw.isfixed = False;
+	colorname = colorname_light;
 
 	for(i = 1; i < argc; i++) {
 		switch(argv[i][0] != '-' || argv[i][2] ? -1 : argv[i][1]) {
@@ -3255,6 +3257,9 @@ main(int argc, char *argv[]) {
 		case 't':
 			if(++i < argc)
 				opt_title = argv[i];
+			break;
+		case 'd':
+			colorname = colorname_dark;
 			break;
 		case 'v':
 		default:
